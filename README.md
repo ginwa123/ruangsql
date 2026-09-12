@@ -1,5 +1,7 @@
 # ruangsql
 
+> WARNING: This repo is AI slop and experimental, DO NOT USE IN PRODUCTION!!!!!!
+
 Self-contained Zig package exposing the sqlite3 + libpq bindings used by
 nalarcore. Extracted from `ginwaaitoolbox/src/modules/databases/`.
 

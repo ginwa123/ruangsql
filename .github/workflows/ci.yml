@@ -21,29 +21,17 @@ env:
 jobs:
   test:
     # GitHub-hosted runners only — no self-hosted labels.
+    # NOTE: no `services:` here — container services only run on Linux
+    # runners ("Container operations are only supported on Linux
+    # runners"). Postgres-backed coverage lives in the `test-postgres`
+    # job below (ubuntu-only). Without a server, the postgres tests
+    # self-skip via test_helpers.getOrStartTestInstance.
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-
-    services:
-      # Real postgres for the `-Ddb_used=sqlite,postgres` run below.
-      # Only effective on ubuntu-latest (jobs can't condition services
-      # per-OS); on macOS/Windows the postgres tests self-skip via
-      # test_helpers.getOrStartTestInstance when no server is reachable.
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: postgres
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
 
     steps:
       - name: Checkout
@@ -70,12 +58,12 @@ jobs:
         run: |
           vcpkg install sqlite3:x64-windows libpq:x64-windows openssl:x64-windows
 
-      - name: Fetch vendored sqlite3 (non-Linux / cross-compile fallback)
+      # Idempotent safety net: hosts without system libs fall back to
+      # the vendored amalgamation, which must exist at build time.
+      # Skips automatically when vendor/sqlite3/ is already populated.
+      - name: Fetch vendored sqlite3 (fallback for hosts without system libs)
         shell: bash
-        run: |
-          if [ "${{ runner.os }}" != "Linux" ]; then
-            bash scripts/fetch-vendor-sqlite3.sh
-          fi
+        run: bash scripts/fetch-vendor-sqlite3.sh
 
       - name: Test (sqlite-only, system libs)
         run: zig build test
@@ -85,3 +73,51 @@ jobs:
 
       - name: Test (vendored amalgamation path)
         run: zig build test -Dforce-vendor=true
+
+  test-postgres:
+    # Real postgres coverage on ubuntu-latest (the only runner family
+    # that supports container services). The `test` job above covers
+    # the build matrix; this job proves the postgres backend against
+    # a live server.
+    name: test-postgres (ubuntu-latest + pg16 service)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev libpq-dev libssl-dev postgresql-client
+
+      - name: Fetch vendored sqlite3 (fallback for hosts without system libs)
+        shell: bash
+        run: bash scripts/fetch-vendor-sqlite3.sh
+
+      # Point the suite at the service container above. Without this,
+      # getOrStartTestInstance probes the default local socket
+      # (host=/tmp port=54329 user=ginwa) and the postgres tests
+      # self-skip with no assertions.
+      - name: Test (sqlite + postgres, live server)
+        run: zig build test -Ddb_used=sqlite,postgres
+        env:
+          POSTGRES_TEST_CONNINFO: "host=localhost port=5432 user=postgres password=postgres dbname=postgres connect_timeout=10"

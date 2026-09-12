@@ -155,19 +155,33 @@ pub fn probeSystemLibs(b: *std.Build, target: std.Build.ResolvedTarget) SystemLi
     var crypto_lib: bool = false;
     switch (b.graph.host.result.os.tag) {
         .linux => {
+            // Debian/Ubuntu use multiarch lib dirs
+            // (/usr/lib/<triplet>/...), Arch/Fedora use /usr/lib/ directly.
+            // Check both layouts.
             sqlite_hdr = fileExists("/usr/include/sqlite3.h");
-            sqlite_lib = fileExists("/usr/lib/libsqlite3.so");
+            sqlite_lib = fileExists("/usr/lib/libsqlite3.so") or
+                fileExists("/usr/lib/x86_64-linux-gnu/libsqlite3.so") or
+                fileExists("/usr/lib/aarch64-linux-gnu/libsqlite3.so");
             pq_hdr = fileExists("/usr/include/postgresql/libpq-fe.h") or
                 fileExists("/usr/include/libpq-fe.h");
-            pq_lib = fileExists("/usr/lib/libpq.so");
+            pq_lib = fileExists("/usr/lib/libpq.so") or
+                fileExists("/usr/lib/x86_64-linux-gnu/libpq.so") or
+                fileExists("/usr/lib/aarch64-linux-gnu/libpq.so");
             ssl_hdr = fileExists("/usr/include/openssl/ssl.h");
-            ssl_lib = fileExists("/usr/lib/libssl.so");
-            crypto_lib = fileExists("/usr/lib/libcrypto.so");
+            ssl_lib = fileExists("/usr/lib/libssl.so") or
+                fileExists("/usr/lib/x86_64-linux-gnu/libssl.so") or
+                fileExists("/usr/lib/aarch64-linux-gnu/libssl.so");
+            crypto_lib = fileExists("/usr/lib/libcrypto.so") or
+                fileExists("/usr/lib/x86_64-linux-gnu/libcrypto.so") or
+                fileExists("/usr/lib/aarch64-linux-gnu/libcrypto.so");
         },
         .macos => {
+            // Homebrew formula is `sqlite` (opt dir `sqlite`), not `sqlite3`.
             sqlite_hdr = fileExists("/opt/homebrew/opt/sqlite3/include/sqlite3.h") or
+                fileExists("/opt/homebrew/opt/sqlite/include/sqlite3.h") or
                 fileExists("/usr/include/sqlite3.h");
             sqlite_lib = fileExists("/opt/homebrew/opt/sqlite3/lib/libsqlite3.dylib") or
+                fileExists("/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib") or
                 fileExists("/usr/lib/libsqlite3.dylib");
             pq_hdr = fileExists("/opt/homebrew/opt/libpq/include/libpq-fe.h") or
                 fileExists("/usr/include/libpq-fe.h");
