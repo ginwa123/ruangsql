@@ -32,6 +32,16 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        # Windows: stock vcpkg sqlite3 lacks the fts5 module, so force
+        # the vendored amalgamation (libpq/openssl still come from
+        # vcpkg). Other OSes link their system sqlite3.
+        include:
+          - os: ubuntu-latest
+            sqlite_vendor: ""
+          - os: macos-latest
+            sqlite_vendor: ""
+          - os: windows-latest
+            sqlite_vendor: "-Dsqlite-vendor=true"
 
     steps:
       - name: Checkout
@@ -75,10 +85,10 @@ jobs:
         run: bash scripts/fetch-vendor-sqlite3.sh
 
       - name: Test (sqlite-only, system libs)
-        run: zig build test
+        run: zig build test ${{ matrix.sqlite_vendor }}
 
       - name: Test (sqlite + postgres)
-        run: zig build test -Ddb_used=sqlite,postgres
+        run: zig build test -Ddb_used=sqlite,postgres ${{ matrix.sqlite_vendor }}
 
       - name: Test (vendored amalgamation path)
         run: zig build test -Dforce-vendor=true

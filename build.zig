@@ -279,6 +279,17 @@ pub fn build(b: *std.Build) void {
         "Skip the system probe and always compile the vendored sqlite3 amalgamation",
     ) orelse false;
 
+    // Force the vendored sqlite3 amalgamation even when the probe finds
+    // system sqlite3. libpq/openssl still follow the probe — only the
+    // sqlite3 link switches to vendored. Useful when the system sqlite3
+    // lacks FTS5 (e.g. stock vcpkg builds ship without the fts5 module,
+    // which this package's tests require).
+    const sqlite_vendor = b.option(
+        bool,
+        "sqlite-vendor",
+        "Always compile the vendored sqlite3 amalgamation (with FTS5) instead of linking system sqlite3; libpq/openssl still follow the system probe",
+    ) orelse false;
+
     // Backend list — set by the app's root build.zig (`-Ddb_used`),
     // forwarded verbatim via `b.dependency("databases", ...)`.
     // Comma-separated (the build runner only passes strings on the
@@ -383,7 +394,7 @@ pub fn build(b: *std.Build) void {
     };
     switch (target.result.os.tag) {
         .linux => {
-            if (sys.use_system_sqlite3) {
+            if (sys.use_system_sqlite3 and !sqlite_vendor) {
                 // System sqlite3 — link the shared lib. Don't compile
                 // the amalgamation (saves ~3 min on first build +
                 // ~10 MB of build artifacts).
@@ -391,6 +402,10 @@ pub fn build(b: *std.Build) void {
             } else {
                 // Vendored amalgamation. Compile the .c into every
                 // consumer (Zig caches the resulting object file).
+                // (Also taken when -Dsqlite-vendor=true even though the
+                // probe found system sqlite3 — the top-level vendor
+                // include above only covers probe-false, so add it here.)
+                mod.addIncludePath(b.path(vendor_dir));
                 mod.addCSourceFile(.{ .file = sqlite_c, .flags = sqlite_flags });
             }
             // libpq — only when the app opted in via -Ddb_used AND
@@ -420,12 +435,13 @@ pub fn build(b: *std.Build) void {
             // with an /opt/homebrew/opt/sqlite3/ alternate) when the
             // probe finds it. Otherwise fall back to the vendored
             // amalgamation (works on every host with a C compiler).
-            if (sys.use_system_sqlite3) {
+            if (sys.use_system_sqlite3 and !sqlite_vendor) {
                 mod.linkSystemLibrary("sqlite3", .{});
                 mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/sqlite/lib" });
                 mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/sqlite3/lib" });
                 mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
             } else {
+                mod.addIncludePath(b.path(vendor_dir));
                 mod.addCSourceFile(.{ .file = sqlite_c, .flags = sqlite_flags });
             }
             // libpq — only when the app opted in via -Ddb_used AND the
@@ -462,7 +478,16 @@ pub fn build(b: *std.Build) void {
             // the file the build.zig hands it.
             if (sys.use_system_sqlite3) {
                 mod.addIncludePath(.{ .cwd_relative = "C:/vcpkg/installed/x64-windows/include" });
-                mod.addObjectFile(.{ .cwd_relative = "C:/vcpkg/installed/x64-windows/lib/sqlite3.lib" });
+                if (!sqlite_vendor) {
+                    mod.addObjectFile(.{ .cwd_relative = "C:/vcpkg/installed/x64-windows/lib/sqlite3.lib" });
+                } else {
+                    // Stock vcpkg sqlite3 builds lack the fts5 module this
+                    // package requires — compile the amalgamation (with
+                    // FTS5 flags) instead, while still taking libpq/ssl
+                    // from vcpkg below.
+                    mod.addIncludePath(b.path(vendor_dir));
+                    mod.addCSourceFile(.{ .file = sqlite_c, .flags = sqlite_flags });
+                }
                 // libpq on Windows — same app gate as Linux above.
                 if (enable_postgres and sys.use_system_pq) {
                     mod.addObjectFile(.{ .cwd_relative = "C:/vcpkg/installed/x64-windows/lib/libpq.lib" });
