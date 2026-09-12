@@ -88,7 +88,10 @@ jobs:
         run: zig build test ${{ matrix.sqlite_vendor }}
 
       - name: Test (sqlite + postgres)
-        run: zig build test -Ddb_used=sqlite,postgres ${{ matrix.sqlite_vendor }}
+        # Quoted: PowerShell parses a bare comma as an array operator
+        # ("Missing argument in parameter list"); quotes are harmless
+        # on bash too.
+        run: zig build test "-Ddb_used=sqlite,postgres" ${{ matrix.sqlite_vendor }}
 
       - name: Test (vendored amalgamation path)
         run: zig build test -Dforce-vendor=true
@@ -137,6 +140,6 @@ jobs:
       # (host=/tmp port=54329 user=ginwa) and the postgres tests
       # self-skip with no assertions.
       - name: Test (sqlite + postgres, live server)
-        run: zig build test -Ddb_used=sqlite,postgres
+        run: zig build test "-Ddb_used=sqlite,postgres"
         env:
           POSTGRES_TEST_CONNINFO: "host=localhost port=5432 user=postgres password=postgres dbname=postgres connect_timeout=10"
