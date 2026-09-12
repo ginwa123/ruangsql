@@ -358,6 +358,10 @@ pub fn build(b: *std.Build) void {
         // self-hosted runner after the databases probe started returning
         // `use_system_sqlite3=true` against the vcpkg install).
         if (target.result.os.tag == .macos) {
+            // Brew keg-only layouts: formula `sqlite` lives at
+            // opt/sqlite (NOT opt/sqlite3); keep the sqlite3 alternate
+            // for hosts that have it under that name.
+            mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/sqlite/include" });
             mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/sqlite3/include" });
         }
         if (target.result.os.tag == .linux) {
@@ -412,18 +416,28 @@ pub fn build(b: *std.Build) void {
         },
         .macos => {
             // macOS native: prefer the system sqlite3 from Homebrew
-            // (keg-only at /opt/homebrew/opt/sqlite3/) when the probe
-            // finds it. Otherwise fall back to the vendored
+            // (keg-only: formula `sqlite` at /opt/homebrew/opt/sqlite/,
+            // with an /opt/homebrew/opt/sqlite3/ alternate) when the
+            // probe finds it. Otherwise fall back to the vendored
             // amalgamation (works on every host with a C compiler).
-            // macOS doesn't currently use libpq or openssl via this
-            // package — ssl/crypto are wired only in kabelweb
-            // (the libcurl backend needs them for https://).
             if (sys.use_system_sqlite3) {
                 mod.linkSystemLibrary("sqlite3", .{});
+                mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/sqlite/lib" });
                 mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/sqlite3/lib" });
                 mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
             } else {
                 mod.addCSourceFile(.{ .file = sqlite_c, .flags = sqlite_flags });
+            }
+            // libpq — only when the app opted in via -Ddb_used AND the
+            // probe found brew libpq (keg-only at
+            // /opt/homebrew/opt/libpq/). Same gate as the Linux branch.
+            // (openssl/ssl/crypto stay unwired here — on macOS those are
+            // owned by kabelweb's libcurl backend, and brew libpq's own
+            // dylib carries absolute LC_LOAD paths to brew openssl.)
+            if (enable_postgres and sys.use_system_pq) {
+                mod.linkSystemLibrary("pq", .{});
+                mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/libpq/lib" });
+                mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/libpq/include" });
             }
         },
         .windows => {
