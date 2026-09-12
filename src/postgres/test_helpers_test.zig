@@ -13,6 +13,7 @@
 //! hosts without a running PG instance (e.g. CI without libpq).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const helpers = @import("test_helpers.zig");
 const PostgresBackend = @import("Postgres.zig").PostgresBackend;
@@ -390,10 +391,15 @@ test "LEAK: no stray databases — pg_database is empty after a stress run" {
 /// `/proc/self/fd/`. Used by the fd-leak test to confirm libpq isn't
 /// leaking fds across N `createTempDb`/`dropTempDb` cycles.
 ///
-/// Linux-only: `/proc/self/fd` doesn't exist on Windows. Uses libc
-/// `opendir`/`readdir` because the Zig 0.16 std.fs API requires an
-/// `Io` runtime which we'd rather not drag into this helper.
+/// Linux-only: `/proc/self/fd` doesn't exist on macOS/Windows, and
+/// `std.c.readdir` isn't even declared there (compile error). The
+/// comptime gate below prunes the POSIX body on non-Linux targets so
+/// the postgres suite still compiles there (its tests self-skip
+/// without a server anyway). Uses libc `opendir`/`readdir` because
+/// the Zig 0.16 std.fs API requires an `Io` runtime which we'd rather
+/// not drag into this helper.
 fn countOpenFds() usize {
+    if (comptime builtin.os.tag != .linux) return 0;
     const maybe_dir = std.c.opendir("/proc/self/fd");
     const dir = maybe_dir orelse return 0;
     defer _ = std.c.closedir(dir);
