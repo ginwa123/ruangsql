@@ -177,8 +177,11 @@ test "deinit is idempotent (no double-free crash)" {
     ctx.db.deinit();
     // threaded still needs to be cleaned up.
     ctx.threaded.deinit();
-    // Skip the DROP DATABASE because we already closed the connection,
-    // but the admin conn IF EXISTS branch handles "doesn't exist".
+    // Drop the test database directly. The backend is already closed
+    // above, so dropTempDb's deinit steps must NOT run again — but the
+    // DROP itself still has to happen, otherwise this test leaks a
+    // database on the shared instance on every live-server run.
+    helpers.dropDatabase(alloc, env.conninfo, ctx.db_name);
     alloc.free(ctx.db_name);
 }
 

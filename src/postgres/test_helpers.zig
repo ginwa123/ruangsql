@@ -79,7 +79,10 @@ pub const DEFAULT_TEST_CONNINFO = "host=/tmp port=54329 user=ginwa dbname=postgr
 /// valid for the duration of the test process (the cache is never
 /// freed — it lives in the BSS via a `var` global).
 pub const TestEnv = struct {
-    conninfo: []const u8,
+    /// NUL-terminated (libpq takes C strings). The env-var path stores
+    /// a dupeZ copy; the default path stores the string literal, which
+    /// carries its sentinel. Either way `conninfo[len - 1] == 0` holds.
+    conninfo: [:0]const u8,
     is_available: bool,
 };
 
@@ -115,19 +118,22 @@ pub var g_test_env_initialized: bool = false;
 /// `env.conninfo` to the workers (the `LEAK: createTempDb parallel`
 /// test does this).
 pub fn getOrStartTestInstance(allocator: std.mem.Allocator) TestEnv {
+    // No allocation happens here anymore (env span points into process
+    // environ; default is a static literal). Discard to satisfy the
+    // compiler; the parameter stays so callers don't change.
+    _ = allocator;
     if (g_test_env_initialized) return g_test_env;
 
     // Try POSTGRES_TEST_CONNINFO env var first — lets users override
-    // the test target (e.g. to a remote PG instance).
+    // the test target (e.g. to a remote PG instance). The getenv span
+    // points into process environ memory (stable for the whole test
+    // process), so no dupe is needed — and a dupe would trip the
+    // testing.allocator leak detector since the cache is never freed.
     if (std.c.getenv("POSTGRES_TEST_CONNINFO")) |raw| {
         const span = std.mem.span(raw);
-        const dup = allocator.dupeZ(u8, span) catch return .{
-            .conninfo = "",
-            .is_available = false,
-        };
         g_test_env = .{
-            .conninfo = dup,
-            .is_available = testConnect(dup),
+            .conninfo = span,
+            .is_available = testConnect(span),
         };
     } else {
         g_test_env = .{
@@ -269,6 +275,12 @@ pub fn createDatabase(allocator: std.mem.Allocator, admin_conninfo: []const u8, 
 /// but it guards against cases where another part of the test
 /// process is still holding the connection.
 pub fn dropTempDb(allocator: std.mem.Allocator, ctx: *TestDb) void {
+    // Idempotent: the first call frees db_name and resets the ctx
+    // (db_name empty, conn null, threaded undefined). A second call
+    // must not touch any of that again — in particular, deinit-ing
+    // `threaded` twice hangs on the garbage state.
+    if (ctx.db_name.len == 0) return;
+
     // 1. Close the per-test backend. Sets ctx.db.conn to null.
     ctx.db.deinit();
     ctx.threaded.deinit();

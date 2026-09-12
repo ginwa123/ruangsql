@@ -24,9 +24,10 @@ test "getOrStartTestInstance returns a usable TestEnv on a live instance" {
     if (!env.is_available) return; // skip silently if no PG
 
     // The conninfo is non-empty and NUL-terminated (libpq requires
-    // the C string to have a NUL).
+    // the C string to have a NUL). For a [:0] slice the sentinel lives
+    // at index len (len itself excludes it).
     try testing.expect(env.conninfo.len > 0);
-    try testing.expect(env.conninfo[env.conninfo.len - 1] == 0);
+    try testing.expect(env.conninfo[env.conninfo.len] == 0);
 }
 
 test "getOrStartTestInstance is idempotent (cached after first call)" {
@@ -244,6 +245,11 @@ test "dropDatabase: standalone helper drops a database (no TestDb needed)" {
     // create and drop never leaves a stray database.
     try helpers.createDatabase(alloc, env.conninfo, db_name);
     defer helpers.dropDatabase(alloc, env.conninfo, db_name);
+
+    // Drop NOW, then verify it's gone. (The defer above stays as a
+    // safety net for failures between create and drop — dropping a
+    // missing database is non-fatal via IF EXISTS.)
+    helpers.dropDatabase(alloc, env.conninfo, db_name);
 
     // Verify it's gone.
     const probe = PostgresBackend.c.PQconnectdb(env.conninfo.ptr);
