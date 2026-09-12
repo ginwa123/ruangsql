@@ -98,7 +98,7 @@ pub const PostgresBackend = struct {
             pub const PGRES_COPY_BOTH: c_int = 9;
             pub const PGRES_SINGLE_TUPLE: c_int = 10;
 
-            pub extern fn PQconnectdb(conninfo: [*:0]const u8) ?*PGconn;
+            pub extern fn PQconnectdb(conninfo: [*c]const u8) ?*PGconn;
             pub extern fn PQfinish(conn: ?*PGconn) void;
             pub extern fn PQstatus(conn: ?*PGconn) c_int;
             pub extern fn PQerrorMessage(conn: ?*PGconn) [*:0]const u8;
@@ -108,7 +108,7 @@ pub const PostgresBackend = struct {
                 command: [*:0]const u8,
                 nParams: c_int,
                 paramTypes: ?*const c_int,
-                paramValues: ?*const ?[*:0]const u8,
+                paramValues: [*c]const ?[*:0]const u8,
                 paramLengths: ?*const c_int,
                 paramFormats: ?*const c_int,
                 resultFormat: c_int,

@@ -58,6 +58,15 @@ jobs:
         run: |
           vcpkg install sqlite3:x64-windows libpq:x64-windows openssl:x64-windows
 
+      # Windows: the test binary links vcpkg import .libs (sqlite3.lib,
+      # libpq.lib, …) and needs the matching DLLs at RUNTIME. Without
+      # vcpkg/bin on PATH the loader picks a stale system sqlite3.dll
+      # (or none) and every sqlite test segfaults. Same requirement as
+      # the main repo's prependVcpkgBinToPath build helper.
+      - name: Add vcpkg DLLs to PATH (Windows)
+        if: runner.os == 'Windows'
+        run: echo "C:\vcpkg\installed\x64-windows\bin" | Out-File -Append $env:GITHUB_PATH
+
       # Idempotent safety net: hosts without system libs fall back to
       # the vendored amalgamation, which must exist at build time.
       # Skips automatically when vendor/sqlite3/ is already populated.
