@@ -1,0 +1,87 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel in-progress runs for the same ref when a new commit is pushed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  test:
+    # GitHub-hosted runners only — no self-hosted labels.
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    services:
+      # Real postgres for the `-Ddb_used=sqlite,postgres` run below.
+      # Only effective on ubuntu-latest (jobs can't condition services
+      # per-OS); on macOS/Windows the postgres tests self-skip via
+      # test_helpers.getOrStartTestInstance when no server is reachable.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install system deps (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev libpq-dev libssl-dev
+
+      - name: Install system deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install sqlite libpq openssl@3
+
+      - name: Install system deps (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          vcpkg install sqlite3:x64-windows libpq:x64-windows openssl:x64-windows
+
+      - name: Fetch vendored sqlite3 (non-Linux / cross-compile fallback)
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" != "Linux" ]; then
+            bash scripts/fetch-vendor-sqlite3.sh
+          fi
+
+      - name: Test (sqlite-only, system libs)
+        run: zig build test
+
+      - name: Test (sqlite + postgres)
+        run: zig build test -Ddb_used=sqlite,postgres
+
+      - name: Test (vendored amalgamation path)
+        run: zig build test -Dforce-vendor=true

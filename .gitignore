@@ -1,0 +1,15 @@
+# Zig build outputs
+zig-out/
+.zig-cache/
+zig-pkg/
+
+# Vendored sqlite3 amalgamation (~10 MB) — fetched via
+# scripts/fetch-vendor-sqlite3.sh, never committed.
+/vendor/
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
