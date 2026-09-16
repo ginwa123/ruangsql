@@ -46,6 +46,56 @@ else
 /// unified error type.
 pub const Error = sqlite_mod.Error;
 
+/// Explicit backend-or-transaction handle for helpers that run both
+/// outside a tx (`db`) and inside one (`tx`). Every accepted type is
+/// listed here and dispatch is an exhaustive switch, so misuse fails
+/// to compile at the call site. Construct with `.{ .db = db }` or
+/// `.{ .tx = &tx }`.
+///
+/// `Db` (and its `Transaction` / `Rows` / `Row`) resolves to the
+/// backend the app selected via `-Ddb_used`, so this union works for
+/// both sqlite and postgres builds.
+pub const DbOrTx = union(enum) {
+    db: *Db,
+    tx: *Db.Transaction,
+
+    pub fn exec(
+        self: DbOrTx,
+        allocator: std.mem.Allocator,
+        sql: []const u8,
+        argv: []const []const u8,
+    ) Error!void {
+        switch (self) {
+            .db => |d| return d.exec(allocator, sql, argv),
+            .tx => |t| return t.exec(allocator, sql, argv),
+        }
+    }
+
+    pub fn query(
+        self: DbOrTx,
+        allocator: std.mem.Allocator,
+        sql: []const u8,
+        argv: []const []const u8,
+    ) Error!Db.Rows {
+        switch (self) {
+            .db => |d| return d.query(allocator, sql, argv),
+            .tx => |t| return t.query(allocator, sql, argv),
+        }
+    }
+
+    pub fn queryRow(
+        self: DbOrTx,
+        allocator: std.mem.Allocator,
+        sql: []const u8,
+        argv: []const []const u8,
+    ) Error!Db.Row {
+        switch (self) {
+            .db => |d| return d.queryRow(allocator, sql, argv),
+            .tx => |t| return t.queryRow(allocator, sql, argv),
+        }
+    }
+};
+
 /// Unified open config — hides the path-vs-conninfo `init` gap.
 /// Only the variant matching the compiled backend is ever constructed
 /// in practice; `open()` dispatches at comptime to the single `init`

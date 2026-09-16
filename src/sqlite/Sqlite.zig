@@ -481,13 +481,24 @@ pub const SqliteBackend = struct {
         /// the point of the defer-idiom). Mirrors Go's
         /// `(*Tx).CommitOrRollback` (Go 1.21+).
         ///
-        /// The recommended defer-idiom for transactions:
+        /// The recommended defer-idiom for transactions (canonical pattern):
         ///
         /// ```zig
         /// var tx = try db.begin();
-        /// defer tx.commitOrRollback() catch {}; // commits if not yet finalized
-        /// // ... use tx ...
+        /// defer tx.commitOrRollback() catch {};
+        /// errdefer tx.rollback() catch {}; // atomic: error paths roll back
+        /// try tx.exec(alloc, "INSERT INTO foo VALUES (?)", &.{"a"});
+        /// try tx.commit();
         /// ```
+        ///
+        /// The `defer` is a safety net (finalizes on early return), the
+        /// explicit `commit()` is the happy-path finalize. If `commit()`
+        /// already ran, the deferred `commitOrRollback()` is a silent
+        /// no-op. The `errdefer` keeps error paths atomic: Zig runs
+        /// defers LIFO, so on error `rollback()` fires first and the
+        /// deferred commit becomes a no-op. Without it, the deferred
+        /// commit would persist a partial prefix. Do NOT issue raw "BEGIN"/"COMMIT"/"ROLLBACK" via
+        /// `db.exec()` — that bypasses the mutex + depth tracking.
         ///
         /// This replaces the more verbose pattern:
         ///

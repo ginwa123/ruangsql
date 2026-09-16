@@ -825,8 +825,18 @@ pub const PostgresBackend = struct {
         }
 
         /// Commit the transaction if it has not yet been finalized.
-        /// Mirrors `sqlite/Sqlite.zig::Transaction::commitOrRollback`
-        /// — see that file for the defer idiom.
+        /// Mirrors `sqlite/Sqlite.zig::Transaction::commitOrRollback`.
+        /// Canonical pattern:
+        ///
+        /// ```zig
+        /// var tx = try db.begin();
+        /// defer tx.commitOrRollback() catch {};
+        /// errdefer tx.rollback() catch {}; // atomic: error paths roll back
+        /// try tx.exec(alloc, "INSERT INTO foo VALUES (?)", &.{"a"});
+        /// try tx.commit();
+        /// ```
+        ///
+        /// Do NOT issue raw "BEGIN"/"COMMIT"/"ROLLBACK" via `db.exec()`.
         pub fn commitOrRollback(self: *Transaction) Error!void {
             if (self.completed) return;
             return self._doFinalizeCommit();

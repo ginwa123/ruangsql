@@ -21,17 +21,22 @@
 //!   within the same thread that holds a tx — `std.Io.Mutex` is not
 //!   reentrant. Use the `tx.*` variants instead.
 //!
-//! Usage example — recommended defer pattern vs. commit-at-bottom:
+//! Usage example — canonical pattern (defer as safety net + explicit commit):
 //!
 //! ```zig
-//! // Recommended (single line, robust to early returns):
 //! var tx = try db.begin();
-//! defer tx.commitOrRollback() catch {};  // commits when scope exits
+//! defer tx.commitOrRollback() catch {};
+//! errdefer tx.rollback() catch {}; // atomic: error paths roll back
 //! try tx.exec(alloc, "INSERT INTO foo VALUES ('a')", &.{});
 //! try tx.exec(alloc, "UPDATE foo SET x = ? WHERE id = ?", &.{"1", "a"});
-//! // No explicit commit() at the bottom — defer handles it.
+//! try tx.commit();
+//! ```
 //!
-//! // Older style (commit at the bottom of the function):
+//! Do NOT issue raw "BEGIN" / "COMMIT" / "ROLLBACK" via `db.exec()` —
+//! that bypasses the backend mutex + transaction_depth tracking. Always
+//! go through `db.begin()` / `tx.exec()` / `tx.commit()` as above.
+//!
+//! Older style (commit at the bottom with verbose rollback defer):
 //! var tx = try db.begin();
 //! defer tx.rollback() catch |err| switch (err) {
 //!     error.TransactionClosed => {},   // already committed — safe no-op
@@ -956,10 +961,10 @@ test "query before init returns DatabaseNotFound" {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Group 7: Transaction (BEGIN/COMMIT/ROLLBACK)
+//  Group 7: Transaction (tx commit/rollback via API — never raw BEGIN/COMMIT)
 // ═══════════════════════════════════════════════════════════════════════════
 
-test "BEGIN/COMMIT transaction commits inserts" {
+test "tx commit commits inserts" {
     var ctx = try setupDb();
     defer teardown(&ctx);
     const alloc = testing.allocator;
@@ -967,10 +972,11 @@ test "BEGIN/COMMIT transaction commits inserts" {
     try ctx.db.exec(alloc,
         "CREATE TABLE foo (id TEXT PRIMARY KEY)", &.{});
 
-    try ctx.db.exec(alloc, "BEGIN", &.{});
-    try ctx.db.exec(alloc,
+    var tx = try ctx.db.begin();
+    defer tx.commitOrRollback() catch {};
+    try tx.exec(alloc,
         "INSERT INTO foo VALUES ('a'), ('b')", &.{});
-    try ctx.db.exec(alloc, "COMMIT", &.{});
+    try tx.commit();
 
     const cnt = (try scalarText(alloc, &ctx.db,
         "SELECT COUNT(*) FROM foo", &.{})) orelse "";
@@ -978,7 +984,7 @@ test "BEGIN/COMMIT transaction commits inserts" {
     try testing.expectEqualStrings("2", cnt);
 }
 
-test "BEGIN/ROLLBACK transaction undoes inserts" {
+test "tx rollback undoes inserts" {
     var ctx = try setupDb();
     defer teardown(&ctx);
     const alloc = testing.allocator;
@@ -986,9 +992,11 @@ test "BEGIN/ROLLBACK transaction undoes inserts" {
     try ctx.db.exec(alloc,
         "CREATE TABLE foo (id TEXT PRIMARY KEY)", &.{});
 
-    try ctx.db.exec(alloc, "BEGIN", &.{});
-    try ctx.db.exec(alloc, "INSERT INTO foo VALUES ('a'), ('b')", &.{});
-    try ctx.db.exec(alloc, "ROLLBACK", &.{});
+    var tx = try ctx.db.begin();
+    defer tx.commitOrRollback() catch {};
+    try tx.exec(alloc,
+        "INSERT INTO foo VALUES ('a'), ('b')", &.{});
+    try tx.rollback();
 
     const cnt = (try scalarText(alloc, &ctx.db,
         "SELECT COUNT(*) FROM foo", &.{})) orelse "";

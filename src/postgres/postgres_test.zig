@@ -949,10 +949,10 @@ test "query before init returns DatabaseNotFound" {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Group 7: Transaction (raw SQL form)
+//  Group 7: Transaction (tx commit/rollback via API -- never raw BEGIN/COMMIT)
 // ═══════════════════════════════════════════════════════════════════════════
 
-test "BEGIN/COMMIT transaction commits inserts" {
+test "tx commit commits inserts" {
     const alloc = testing.allocator;
     const env = ensureEnv(alloc);
     if (!env.is_available) return;
@@ -963,9 +963,10 @@ test "BEGIN/COMMIT transaction commits inserts" {
     try ctx.db.exec(alloc,
         "CREATE TABLE foo (id TEXT PRIMARY KEY)", &.{});
 
-    try ctx.db.exec(alloc, "BEGIN", &.{});
-    try ctx.db.exec(alloc, "INSERT INTO foo VALUES ('a'), ('b')", &.{});
-    try ctx.db.exec(alloc, "COMMIT", &.{});
+    var tx = try ctx.db.begin();
+    defer tx.commitOrRollback() catch {};
+    try tx.exec(alloc, "INSERT INTO foo VALUES ('a'), ('b')", &.{});
+    try tx.commit();
 
     const cnt = (try scalarText(alloc, &ctx.db,
         "SELECT COUNT(*) FROM foo", &.{})) orelse "";
@@ -973,7 +974,7 @@ test "BEGIN/COMMIT transaction commits inserts" {
     try testing.expectEqualStrings("2", cnt);
 }
 
-test "BEGIN/ROLLBACK transaction undoes inserts" {
+test "tx rollback undoes inserts" {
     const alloc = testing.allocator;
     const env = ensureEnv(alloc);
     if (!env.is_available) return;
@@ -984,9 +985,10 @@ test "BEGIN/ROLLBACK transaction undoes inserts" {
     try ctx.db.exec(alloc,
         "CREATE TABLE foo (id TEXT PRIMARY KEY)", &.{});
 
-    try ctx.db.exec(alloc, "BEGIN", &.{});
-    try ctx.db.exec(alloc, "INSERT INTO foo VALUES ('a'), ('b')", &.{});
-    try ctx.db.exec(alloc, "ROLLBACK", &.{});
+    var tx = try ctx.db.begin();
+    defer tx.commitOrRollback() catch {};
+    try tx.exec(alloc, "INSERT INTO foo VALUES ('a'), ('b')", &.{});
+    try tx.rollback();
 
     const cnt = (try scalarText(alloc, &ctx.db,
         "SELECT COUNT(*) FROM foo", &.{})) orelse "";
