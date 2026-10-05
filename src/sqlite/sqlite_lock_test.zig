@@ -96,16 +96,31 @@ const TwoConns = struct {
 };
 
 /// One connection opens a transaction, writes, holds WAL's single writer
-/// slot for `HOLD_MS`, then commits. `locked` flips the instant the write
-/// is inside the transaction, so the main thread never races thread
-/// start-up — a plain sleep there would make the whole test vacuous.
+/// slot for `HOLD_MS`, then commits.
+///
+/// Two flags, and both are needed:
+///
+///   - `locked` flips the instant the write is inside the transaction, so
+///     the main thread never races thread start-up. A plain sleep there
+///     would let the write win and make the whole test vacuous.
+///   - `done` flips after the COMMIT returns, so the main thread can await
+///     the holder WITHOUT calling `join()` itself. `std.Thread.join` on an
+///     already-joined thread hits `unreachable`, which is exactly the crash
+///     CI found when this had `defer thread.join()` plus an explicit
+///     `thread.join()`.
 const HoldWriter = struct {
     db: *SqliteBackend,
     allocator: std.mem.Allocator,
     io: std.Io,
     locked: *std.atomic.Value(bool),
+    done: *std.atomic.Value(bool),
 
-    fn run(self: *HoldWriter) !void {
+    fn run(self: *HoldWriter) void {
+        defer self.done.store(true, .release);
+        self.hold() catch {};
+    }
+
+    fn hold(self: *HoldWriter) !void {
         var tx = try self.db.begin();
         defer tx.rollback() catch {};
         try tx.exec(self.allocator, "INSERT INTO t VALUES (1)", &.{});
@@ -115,10 +130,14 @@ const HoldWriter = struct {
     }
 };
 
-fn waitForFlag(locked: *const std.atomic.Value(bool)) !void {
+/// Spin until `flag` flips. 20 000 x 1 ms ~= 20 s of wall clock, which is
+/// an order of magnitude past anything the holder needs — hitting it means
+/// the holder thread died, and the holder swallows its own error, so this
+/// is the only way the main thread learns about it.
+fn waitForFlag(flag: *const std.atomic.Value(bool)) !void {
     var spins: usize = 0;
-    while (!locked.load(.acquire)) : (spins += 1) {
-        if (spins > 5_000) return error.HolderNeverTookTheWriteLock;
+    while (!flag.load(.acquire)) : (spins += 1) {
+        if (spins > 20_000) return error.HolderNeverSignalled;
         sleepMs(testing.io, 1);
     }
 }
@@ -206,11 +225,13 @@ test "a write waits out a competing writer instead of failing" {
     defer conns.deinit();
 
     var locked = std.atomic.Value(bool).init(false);
+    var done = std.atomic.Value(bool).init(false);
     var hold = HoldWriter{
         .db = &conns.a,
         .allocator = alloc,
         .io = conns.threaded.io(),
         .locked = &locked,
+        .done = &done,
     };
     const thread = try std.Thread.spawn(.{}, HoldWriter.run, .{&hold});
     defer thread.join();
@@ -221,7 +242,7 @@ test "a write waits out a competing writer instead of failing" {
     // armed by the config, covers the holder's HOLD_MS hold.
     try conns.b.exec(alloc, "INSERT INTO t VALUES (2)", &.{});
 
-    thread.join();
+    try waitForFlag(&done);
 
     const count = try scalar(&conns.b, "SELECT COUNT(*) FROM t");
     defer alloc.free(count);
@@ -239,11 +260,13 @@ test "without a long enough busy_timeout the same race loses the write" {
     defer conns.deinit();
 
     var locked = std.atomic.Value(bool).init(false);
+    var done = std.atomic.Value(bool).init(false);
     var hold = HoldWriter{
         .db = &conns.a,
         .allocator = alloc,
         .io = conns.threaded.io(),
         .locked = &locked,
+        .done = &done,
     };
     const thread = try std.Thread.spawn(.{}, HoldWriter.run, .{&hold});
     defer thread.join();
