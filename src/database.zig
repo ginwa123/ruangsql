@@ -115,6 +115,33 @@ pub fn open(db: *Db, io: std.Io, cfg: OpenConfig) Error!void {
     }
 }
 
+/// The SQLite connection policy `openWithConfig` accepts. Re-exported so a
+/// consumer can name it without reaching into the `sqlite` namespace —
+/// `database.openWithConfig(&db, io, .{ .sqlite_path = p }, .{ .synchronous = .normal })`.
+pub const SqliteConfig = sqlite_mod.Config;
+
+/// Open `db` with an explicit SQLite connection policy.
+///
+/// `sqlite_config` is IGNORED on the postgres backend (that backend has no
+/// pragmas). Passing it keeps `main.zig` compiling under both
+/// `-Ddb_used=sqlite` and `-Ddb_used=sqlite,postgres` without a comptime
+/// branch at every call site.
+///
+/// `open` is exactly `openWithConfig(db, io, cfg, .{})`.
+pub fn openWithConfig(db: *Db, io: std.Io, cfg: OpenConfig, sqlite_config: SqliteConfig) Error!void {
+    if (backend_is_postgres) {
+        switch (cfg) {
+            .sqlite_path => unreachable, // `-Ddb_used` said postgres; a sqlite path cannot arrive here
+            .postgres_conninfo => |c| try db.init(io, c),
+        }
+    } else {
+        switch (cfg) {
+            .sqlite_path => |p| try db.initWithConfig(io, p, sqlite_config),
+            .postgres_conninfo => unreachable,
+        }
+    }
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
 }
