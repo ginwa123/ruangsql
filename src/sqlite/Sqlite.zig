@@ -53,6 +53,99 @@ const sqlite3_bind_text_isize_opt: ?*const sqlite3_bind_text_isize_Fn =
 const sqlite3_bind_text_isize: *const sqlite3_bind_text_isize_Fn =
     sqlite3_bind_text_isize_opt orelse unreachable;
 
+/// Values SQLite accepts for `PRAGMA synchronous`. Kept as an enum (not a
+/// raw integer) so a caller cannot silently pass a bitmask soup.
+pub const Synchronous = enum(u8) {
+    off = 0,
+    normal = 1,
+    full = 2,
+    extra = 3,
+
+    pub fn sql(self: Synchronous) []const u8 {
+        return switch (self) {
+            .off => "OFF",
+            .normal => "NORMAL",
+            .full => "FULL",
+            .extra => "EXTRA",
+        };
+    }
+};
+
+/// Connection policy applied to every `SqliteBackend` at `init`.
+///
+/// WHY THIS EXISTS — `init` used to hard-code `journal_mode=WAL` +
+/// `busy_timeout=5000` and nothing else. WAL gives a database file
+/// exactly ONE writer slot, and a write that cannot take it blocks for
+/// `busy_timeout` and then FAILS: the write is lost, not delayed. With a
+/// 5-second ceiling and several processes sharing one file, every write on
+/// the hot path (`UPDATE sessions …`, `INSERT INTO logs …`) could come
+/// back as:
+///
+/// ```text
+/// warning: sqlite3 step failed: database is locked (sql: …)
+/// ```
+///
+/// …repeated, forever, each one a full 5-second stall.
+///
+/// Defaults, and what each buys:
+///
+///   - `busy_timeout_ms` — the ONLY defence a WAL writer has against a
+///     competing writer. Raised from 5 s to 15 s: the wait costs nothing
+///     when nobody else is writing (it only happens while the slot is
+///     genuinely taken) and converts most real contention from "write
+///     lost" into "write delayed".
+///
+///   - `synchronous` — left at `.full`, SQLite's own default, so this
+///     package does not silently change any consumer's durability. In WAL
+///     mode `.normal` is the documented recommendation (sync at
+///     checkpoints instead of on every commit); an app that prefers it
+///     opts in: `db.applyConfig(alloc, .{ .synchronous = .normal })`.
+///     Trade-off: on an OS crash / power cut the last few commits may be
+///     lost. `PRAGMA integrity_check` still passes and SQLite's WAL
+///     guarantees still hold, because recovery goes through the
+///     checkpoint.
+///
+///   - `journal_size_limit_bytes` — caps the `-wal` file. Without it the
+///     WAL is only ever APPENDED: `wal_autocheckpoint` caps how much is
+///     copied back per checkpoint, but nothing shrinks the file, so on a
+///     long-lived install it grows until a checkpoint can reset it. -1
+///     means "no limit" (SQLite's own default).
+///
+///   - `wal_autocheckpoint_pages` — SQLite's default, stated explicitly
+///     so `Config` is a complete description of the connection rather
+///     than a delta on top of whatever the library happens to do.
+pub const Config = struct {
+    busy_timeout_ms: u32 = 15_000,
+    synchronous: Synchronous = .full,
+    journal_size_limit_bytes: i64 = 64 * 1024 * 1024,
+    wal_autocheckpoint_pages: u32 = 1_000,
+};
+
+/// What `readConfig` observed on the connection. Printed by consumers at
+/// boot so a future "database is locked" report carries the live
+/// connection's actual settings instead of a guess.
+pub const ActiveConfig = struct {
+    /// SQLite's journal-mode names ("delete", "truncate", "persist",
+    /// "memory", "wal", "off") all fit in 16 bytes. A fixed buffer keeps
+    /// `ActiveConfig` allocation-free — it exists for one log line and
+    /// must not hand the caller an ownership obligation.
+    journal_mode_buf: [16]u8 = undefined,
+    journal_mode_len: usize = 0,
+    busy_timeout_ms: u32,
+    synchronous: i64,
+    wal_autocheckpoint_pages: u32,
+    /// Signed: SQLite's default here is -1 ("no limit"), which is exactly
+    /// what an unconfigured connection reports.
+    journal_size_limit_bytes: i64,
+
+    /// Borrowed view of `journal_mode_buf` — valid for as long as `self`.
+    pub fn journalMode(self: *const ActiveConfig) []const u8 {
+        return self.journal_mode_buf[0..self.journal_mode_len];
+    }
+};
+
+const JOURNAL_MODE_BUF_LEN = 16;
+
 pub const Error = error{
     OpenFailed,
     DatabaseNotFound,
@@ -115,7 +208,25 @@ pub const SqliteBackend = struct {
     /// `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` (depth >= 1).
     transaction_depth: u32 = 0,
 
+    /// Open `db_path` with the default `Config`. Same as
+    /// `initWithConfig(io, db_path, .{})`.
     pub fn init(self: *SqliteBackend, io: std.Io, db_path: [:0]const u8) Error!void {
+        return self.initWithConfig(io, db_path, .{});
+    }
+
+    /// Open `db_path` and immediately apply `cfg` to the connection.
+    ///
+    /// WAL is re-asserted here as well: `PRAGMA journal_mode` needs a brief
+    /// exclusive lock to CHANGE mode, but re-asserting it on a database
+    /// that is already in WAL mode is a no-op that does not contend, and
+    /// it makes `initWithConfig` a complete description of the connection
+    /// rather than a delta on top of whatever the library happens to do.
+    pub fn initWithConfig(
+        self: *SqliteBackend,
+        io: std.Io,
+        db_path: [:0]const u8,
+        cfg: Config,
+    ) Error!void {
         self.io = io;
         var db: ?*c.sqlite3 = null;
         const rc = c.sqlite3_open(db_path.ptr, &db);
@@ -130,14 +241,69 @@ pub const SqliteBackend = struct {
             };
         }
         self.db = db;
+        try self.applyConfig(cfg);
+    }
 
-        // Enable WAL mode for better concurrent access (crucial for multi-threaded usage)
-        // WAL allows concurrent reads and single writer, preventing "database is locked" errors
-        // Note: Using null for err_msg - we don't need the error details
-        _ = c.sqlite3_exec(db, "PRAGMA journal_mode=WAL;", null, null, null);
+    /// Re-apply `cfg` to an already-open connection. Needs no allocator:
+    /// the PRAGMA statements are formatted into stack buffers.
+    ///
+    /// Every statement is a PRAGMA with no bind parameters, so routing it
+    /// through the statement path is safe — the "empty slice binds as SQL
+    /// NULL" quirk only bites when a `?` is present.
+    pub fn applyConfig(self: *SqliteBackend, cfg: Config) Error!void {
+        var busy_buf: [64]u8 = undefined;
+        const busy = std.fmt.bufPrint(busy_buf[0..], "PRAGMA busy_timeout = {d}", .{cfg.busy_timeout_ms}) catch return Error.ExecuteFailed;
+        var auto_buf: [64]u8 = undefined;
+        const auto_ckpt = std.fmt.bufPrint(auto_buf[0..], "PRAGMA wal_autocheckpoint = {d}", .{cfg.wal_autocheckpoint_pages}) catch return Error.ExecuteFailed;
+        var size_buf: [64]u8 = undefined;
+        const size_limit = std.fmt.bufPrint(size_buf[0..], "PRAGMA journal_size_limit = {d}", .{cfg.journal_size_limit_bytes}) catch return Error.ExecuteFailed;
+        var sync_buf: [64]u8 = undefined;
+        const sync = std.fmt.bufPrint(sync_buf[0..], "PRAGMA synchronous = {s}", .{cfg.synchronous.sql()}) catch return Error.ExecuteFailed;
 
-        // Also enable busy timeout for better concurrency handling
-        _ = c.sqlite3_exec(db, "PRAGMA busy_timeout=5000;", null, null, null); // 5 second timeout
+        try self.execPragma("PRAGMA journal_mode = WAL");
+        try self.execPragma(busy);
+        try self.execPragma(sync);
+        try self.execPragma(auto_ckpt);
+        try self.execPragma(size_limit);
+    }
+
+    /// `exec` with no allocator: `executeStatement` never touches the
+    /// allocator (it is `_ = allocator` in the body — the parameter exists
+    /// only for signature symmetry with `exec`), so the PRAGMA path can
+    /// pass `undefined` and avoid making every caller thread an allocator
+    /// through just to set a timeout.
+    fn execPragma(self: *SqliteBackend, sql: []const u8) Error!void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        return executeStatement(self, undefined, sql, &.{});
+    }
+
+    /// Read the connection's current settings back.
+    pub fn readConfig(self: *SqliteBackend, allocator: std.mem.Allocator) Error!ActiveConfig {
+        // `Row.values[i]` are allocator-owned and freed by `Row.deinit`, so
+        // every value is copied out BEFORE that defer runs.
+        var row = try self.queryRow(allocator, "PRAGMA journal_mode", &.{});
+        defer row.deinit(allocator);
+        if (row.values.len == 0) return Error.RowNotFound;
+        if (row.values[0].len > JOURNAL_MODE_BUF_LEN) return Error.QueryFailed;
+        var mode_buf: [JOURNAL_MODE_BUF_LEN]u8 = undefined;
+        @memcpy(mode_buf[0..row.values[0].len], row.values[0]);
+
+        return .{
+            .journal_mode_buf = mode_buf,
+            .journal_mode_len = row.values[0].len,
+            .busy_timeout_ms = @intCast(try readPragmaInt(self, allocator, "PRAGMA busy_timeout")),
+            .synchronous = try readPragmaInt(self, allocator, "PRAGMA synchronous"),
+            .wal_autocheckpoint_pages = @intCast(try readPragmaInt(self, allocator, "PRAGMA wal_autocheckpoint")),
+            .journal_size_limit_bytes = try readPragmaInt(self, allocator, "PRAGMA journal_size_limit"),
+        };
+    }
+
+    fn readPragmaInt(self: *SqliteBackend, allocator: std.mem.Allocator, sql: []const u8) Error!i64 {
+        var row = try self.queryRow(allocator, sql, &.{});
+        defer row.deinit(allocator);
+        if (row.values.len == 0) return Error.RowNotFound;
+        return std.fmt.parseInt(i64, row.values[0], 10) catch Error.QueryFailed;
     }
 
     /// Inner implementation: prepare + bind + step a single SQL statement.
@@ -639,14 +805,65 @@ pub const SqliteBackend = struct {
         try self.mutex.lock(self.io);
         errdefer self.mutex.unlock(self.io);
 
-        // Issue BEGIN. On any failure, the errdefer releases the mutex.
-        const rc = c.sqlite3_exec(self.db.?, "BEGIN", null, null, null);
+        // BEGIN IMMEDIATE, not plain BEGIN. This is not a style preference.
+        //
+        // A DEFERRED transaction takes a read snapshot on its first SELECT
+        // and only asks for the write lock when it first WRITES. If any
+        // other connection committed in between, SQLite cannot replay the
+        // reads for the caller, so it returns SQLITE_BUSY_SNAPSHOT —
+        // reported as "database is locked", returned IMMEDIATELY, and the
+        // busy handler is deliberately NOT consulted (there is no safe
+        // retry). Reproduced against SQLite 3.53.4:
+        //
+        //   H2 deferred-BEGIN read-then-write: database is locked (0.0000s)
+        //
+        // So every transaction that reads before it writes was a coin flip
+        // against any other process on the same file. BEGIN IMMEDIATE takes
+        // the write lock up front, where `busy_timeout` DOES apply, and the
+        // wait is honoured.
+        //
+        // A read-only transaction now also holds the write slot for its
+        // lifetime. Call `beginDeferred()` if you genuinely need the old
+        // semantics.
+        //
+        // On any failure, the errdefer releases the mutex.
+        const rc = c.sqlite3_exec(self.db.?, "BEGIN IMMEDIATE", null, null, null);
         if (rc != c.SQLITE_OK) {
             return Error.ExecuteFailed;
         }
 
         // Track depth BEFORE returning the Transaction so commit/rollback
         // can choose the correct SQL (COMMIT vs RELEASE sp_<n>).
+        self.transaction_depth += 1;
+        return Transaction{
+            .backend = self,
+            .depth = self.transaction_depth,
+            .completed = false,
+        };
+    }
+
+    /// Begin a DEFERRED transaction — plain `BEGIN`, taking the write lock
+    /// lazily at the first write.
+    ///
+    /// ⚠️ This is the pre-`BEGIN IMMEDIATE` behaviour and it is a trap: a
+    /// transaction that reads, has another connection commit, and then
+    /// writes fails IMMEDIATELY with `ExecuteFailed` ("database is locked"),
+    /// ignoring `busy_timeout` entirely (SQLITE_BUSY_SNAPSHOT — the reads
+    /// cannot be replayed, so there is no safe retry).
+    ///
+    /// Only use it when the transaction provably never writes — a read-only
+    /// report, say. Anything that writes should use `begin()`.
+    pub fn beginDeferred(self: *SqliteBackend) Error!Transaction {
+        if (self.db == null) return Error.DatabaseNotFound;
+
+        try self.mutex.lock(self.io);
+        errdefer self.mutex.unlock(self.io);
+
+        const rc = c.sqlite3_exec(self.db.?, "BEGIN", null, null, null);
+        if (rc != c.SQLITE_OK) {
+            return Error.ExecuteFailed;
+        }
+
         self.transaction_depth += 1;
         return Transaction{
             .backend = self,
