@@ -169,7 +169,7 @@ pub const SqliteBackend = struct {
         }
         if (rc != c.SQLITE_OK) {
             const err_msg = c.sqlite3_errmsg(db);
-            std.log.warn("sqlite3 prepare failed: {s} (sql: {s})", .{ err_msg, sql });
+            std.log.info("sqlite3 prepare failed: {s} (sql: {s})", .{ err_msg, sql });
             return Error.PrepareFailed;
         }
 
@@ -193,7 +193,7 @@ pub const SqliteBackend = struct {
                 break;
             } else {
                 const err_msg = c.sqlite3_errmsg(db);
-                std.log.warn("sqlite3 step failed: {s} (sql: {s})", .{ err_msg, sql });
+                std.log.info("sqlite3 step failed: {s} (sql: {s})", .{ err_msg, sql });
                 return Error.ExecuteFailed;
             }
         }
