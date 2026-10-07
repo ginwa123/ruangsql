@@ -117,6 +117,93 @@ test "query (Rows iterator) still gives every row, including with the cache in p
     try testing.expectEqualStrings("user_2", r1b.values[0]);
 }
 
+// ─── Empty-string binding: reads vs writes ────────────────────────────────
+
+test "reads bind \"\" as an empty STRING, not NULL (the optional-filter idiom)" {
+    // This is the asymmetry that broke a downstream app: `query`/`queryRow`
+    // have always bound an empty slice as an empty STRING, and callers use
+    // that for optional filters —
+    //
+    //     SELECT id FROM t WHERE (? = '' OR id = ?)
+    //
+    // with the unused filter passed as "". If "" were bound as NULL then
+    // `NULL = ''` is NULL, the WHERE clause is NULL for every row, and the
+    // query returns NOTHING instead of ignoring the filter. `exec` binding
+    // "" as NULL is the (unchanged) write-side convention, so the two must
+    // stay different.
+    var ctx = try setupSeeded();
+    defer teardown(&ctx);
+    const alloc = testing.allocator;
+
+    try ctx.db.exec(alloc, "CREATE TABLE f (id TEXT PRIMARY KEY, v TEXT NOT NULL)", &.{});
+    try ctx.db.exec(alloc, "INSERT INTO f (id, v) VALUES (?, ?)", &.{ "a", "A" });
+    try ctx.db.exec(alloc, "INSERT INTO f (id, v) VALUES (?, ?)", &.{ "b", "B" });
+
+    // queryRow: "" IS the empty string.
+    const probe = try ctx.db.queryRow(alloc, "SELECT (? = '') AS e, (? IS NULL) AS n", &.{ "", "" });
+    defer probe.deinit(alloc);
+    try testing.expectEqualStrings("1", probe.values[0]);
+    try testing.expectEqualStrings("0", probe.values[1]);
+
+    // query: the filter is ignored, so BOTH rows come back.
+    var q = try ctx.db.query(alloc, "SELECT id FROM f WHERE (? = '' OR id = ?) ORDER BY id", &.{ "", "zzz" });
+    defer q.deinit();
+    var seen: usize = 0;
+    while (try q.next()) |row| {
+        defer row.deinit(alloc);
+        seen += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), seen);
+
+    // A real filter still filters.
+    var q2 = try ctx.db.query(alloc, "SELECT id FROM f WHERE (? = '' OR id = ?) ORDER BY id", &.{ "a", "a" });
+    defer q2.deinit();
+    var filtered: usize = 0;
+    while (try q2.next()) |row| {
+        defer row.deinit(alloc);
+        try testing.expectEqualStrings("a", row.values[0]);
+        filtered += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), filtered);
+}
+
+test "exec still binds \"\" as NULL (the write-side convention)" {
+    var ctx = try setupSeeded();
+    defer teardown(&ctx);
+    const alloc = testing.allocator;
+
+    try ctx.db.exec(alloc, "CREATE TABLE nn (id TEXT PRIMARY KEY, v TEXT)", &.{});
+    try ctx.db.exec(alloc, "INSERT INTO nn (id, v) VALUES (?, ?)", &.{ "k", "" });
+
+    const row = try ctx.db.queryRow(alloc, "SELECT COUNT(*) FROM nn WHERE v IS NULL", &.{});
+    defer row.deinit(alloc);
+    try testing.expectEqualStrings("1", row.values[0]);
+
+    // ...and a NOT NULL column rejects it, as documented.
+    try ctx.db.exec(alloc, "CREATE TABLE nn2 (id TEXT PRIMARY KEY, v TEXT NOT NULL)", &.{});
+    try testing.expectError(Error.ExecuteFailed, ctx.db.exec(alloc, "INSERT INTO nn2 (id, v) VALUES (?, ?)", &.{ "k", "" }));
+}
+
+test "one SQL text serves both a read and a write with their own bind rules" {
+    // `exec` and `queryRow` share the statement cache by SQL text, but the
+    // bind rule is chosen per CALL, not per statement — so the same text
+    // must not leak one path's binding into the other's.
+    var ctx = try setupSeeded();
+    defer teardown(&ctx);
+    const alloc = testing.allocator;
+
+    const sql = "SELECT (? = '') AS e, (? IS NULL) AS n";
+    const via_row = try ctx.db.queryRow(alloc, sql, &.{ "", "" });
+    defer via_row.deinit(alloc);
+    try testing.expectEqualStrings("1", via_row.values[0]);
+
+    // Same text, same handle, again — still the read rule.
+    const again = try ctx.db.queryRow(alloc, sql, &.{ "", "" });
+    defer again.deinit(alloc);
+    try testing.expectEqualStrings("1", again.values[0]);
+    try testing.expectEqualStrings("0", again.values[1]);
+}
+
 // ─── Error and edge-case behaviour is unchanged ───────────────────────────
 
 test "exec on malformed SQL still returns PrepareFailed, and stays usable" {
