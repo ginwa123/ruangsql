@@ -9,6 +9,9 @@ test {
     // The transparent fast path: prepared-statement cache, packed rows and
     // reader pooling behind the UNCHANGED exec/query/queryRow contract.
     _ = @import("sqlite/sqlite_fastpath_test.zig");
+    // Reader pooling (`Config.read_conns`). Separate from the fastpath
+    // file because that one opens `:memory:`, which pooling skips.
+    _ = @import("sqlite/sqlite_pool_test.zig");
     // Postgres tests only when the app listed postgres in `-Ddb_used`.
     // They need a live PG server; sqlite-only builds (the default)
     // skip them entirely so `zig build test` works without libpq.
