@@ -85,6 +85,105 @@ const Pool = struct {
     }
 };
 
+/// Count this process's open file descriptors. 0 where there is no way to
+/// ask, so the test that uses it asserts nothing rather than guessing.
+fn countOpenFds() usize {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .linux) return 0;
+    var dir = std.Io.Dir.openDirAbsolute(testing.io, "/proc/self/fd", .{ .iterate = true }) catch return 0;
+    defer dir.close(testing.io);
+    var n: usize = 0;
+    var it = dir.iterate();
+    while (it.next(testing.io) catch null) |_| n += 1;
+    return n;
+}
+
+// THE FD BUG. A pooled reader is not one descriptor — an open WAL
+// connection holds the database file, its `-wal` and its `-shm`. So an
+// UNLIMITED elastic pool spends `3 x peak concurrent reads` descriptors
+// for the life of the process, and a server that already holds a socket
+// per SSE client runs out. When it does, `sqlite3_open` returns
+// SQLITE_CANTOPEN and the next reader's `PRAGMA journal_mode = WAL` fails
+// with "unable to open database file" — which reads like a permissions
+// problem and is neither.
+test "each pooled reader costs FDS_PER_READER descriptors, not one" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var p = try Pool.init(.{ .read_conns = 1, .max_read_conns = 0 });
+    defer p.deinit();
+
+    const before = countOpenFds();
+    // Claim more readers at once than the warm floor, so the pool has to
+    // OPEN new connections rather than reuse idle ones. Then run a real
+    // read on each: a connection holds only the database fd until it
+    // actually touches the WAL, so counting without a query understates
+    // the cost by 2 fds per reader.
+    const extra = 6;
+    var held: [6]*SqliteBackend = undefined;
+    for (0..extra) |i| {
+        held[i] = try p.db.pool.claim(testing.io);
+        var row = try held[i].queryRow(alloc, "SELECT v FROM t WHERE id = ?", &.{"1"});
+        defer row.deinit(alloc);
+    }
+    const after = countOpenFds();
+    for (held) |slot| p.db.pool.release(testing.io, slot);
+
+    // One of the claims reused the pre-warmed reader, so only `extra - 1`
+    // new connections were opened.
+    const opened = extra - 1;
+    try testing.expectEqual(@as(usize, extra), p.db.pool.count());
+    try testing.expectEqual(@as(usize, 2), sqlite.FDS_PER_READER);
+    // No spare needed: `countOpenFds` opens its directory handle in BOTH
+    // samples, so it cancels out of the delta.
+    try testing.expectEqual(sqlite.FDS_PER_READER * opened, after -| before);
+}
+
+// The hard ceiling that stops it. `max_read_conns = 0` means "no POLICY
+// cap", not "no cap": the pool must still refuse to grow past what the
+// process's `RLIMIT_NOFILE` can fund after reserving headroom.
+test "an uncapped pool still stops at the fd-derived ceiling" {
+    const cap = sqlite.fdDerivedReaderCap();
+    try testing.expect(cap >= 1);
+    try testing.expect(sqlite.FD_HEADROOM > 0);
+    // Headroom is reserved, so the ceiling is well under the raw quota.
+    try testing.expect(cap < 1 << 20);
+
+    // Prove the pool obeys the SMALLER of policy and fds.
+    var p = try Pool.init(.{ .read_conns = 1, .max_read_conns = 2 });
+    defer p.deinit();
+
+    var held: [4]*SqliteBackend = undefined;
+    var ok: usize = 0;
+    for (0..4) |_| {
+        held[ok] = p.db.pool.claim(testing.io) catch break;
+        ok += 1;
+    }
+    for (held[0..ok]) |slot| p.db.pool.release(testing.io, slot);
+
+    try testing.expectEqual(@as(usize, 2), ok);
+    try testing.expectEqual(@as(usize, 2), p.db.pool.count());
+}
+
+// A read must never FAIL because the pool could not grow. When the pool
+// is out of capacity — fd quota, memory, anything — the read falls back
+// to the primary connection: slower (it serializes) but correct.
+test "a read falls back to the primary when the pool cannot grow" {
+    const alloc = testing.allocator;
+    // Cap of 1, with that one reader already claimed: the next claim
+    // cannot grow the pool.
+    var p = try Pool.init(.{ .read_conns = 1, .max_read_conns = 1 });
+    defer p.deinit();
+
+    const held = try p.db.pool.claim(testing.io);
+    defer p.db.pool.release(testing.io, held);
+
+    const row = try p.db.queryRow(alloc, "SELECT v FROM t WHERE id = ?", &.{"1"});
+    defer row.deinit(alloc);
+    try testing.expectEqualStrings("before", row.values[0]);
+}
+
 // Positive control: pooling must not break the basic write→read path.
 //
 // `read_conns = 1` keeps this deterministic — the single reader is the
