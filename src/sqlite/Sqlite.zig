@@ -511,7 +511,7 @@ pub const SqliteBackend = struct {
             _ = c.sqlite3_finalize(stmt);
         };
 
-        try bindArgs(stmt, argv);
+        try bindArgsExec(stmt, argv);
 
         while (true) {
             const rc = c.sqlite3_step(stmt);
@@ -586,7 +586,7 @@ pub const SqliteBackend = struct {
             _ = c.sqlite3_finalize(stmt);
         };
 
-        try bindArgs(stmt, argv);
+        try bindArgsText(stmt, argv);
 
         const step_rc = c.sqlite3_step(stmt);
         if (step_rc != c.SQLITE_ROW) {
@@ -958,12 +958,11 @@ pub const SqliteBackend = struct {
             return Error.PrepareFailed;
         }
 
-        for (argv, 0..) |arg, i| {
-            const bind_rc = sqlite3_bind_text_isize(@ptrCast(stmt), @intCast(i + 1), arg.ptr, @intCast(arg.len), SQLITE_DESTRUCTOR_TRANSIENT);
-            if (bind_rc != c.SQLITE_OK) {
-                _ = c.sqlite3_finalize(stmt);
-                return Error.BindFailed;
-            }
+        if (stmt) |s| {
+            bindArgsText(s, argv) catch |err| {
+                _ = c.sqlite3_finalize(s);
+                return err;
+            };
         }
 
         return Rows{
@@ -994,7 +993,7 @@ pub const SqliteBackend = struct {
         errdefer slot.iterating.store(false, .release);
 
         const stmt = try slot.stmt_cache.acquire(db, sql);
-        try bindArgs(stmt, argv);
+        try bindArgsText(stmt, argv);
         return Rows{
             .allocator = allocator,
             .stmt = stmt,
@@ -1085,15 +1084,39 @@ pub const SqliteBackend = struct {
         return stmt.?;
     }
 
-    /// Bind `argv` positionally onto an already-reset statement. An empty
-    /// slice binds SQL NULL — the package-wide convention.
-    fn bindArgs(stmt: *c.sqlite3_stmt, argv: []const []const u8) Error!void {
+    /// Bind `argv` for a WRITE: an empty slice binds SQL NULL. This is the
+    /// package's documented convention for `exec` (an INSERT of `""` stores
+    /// NULL, and a NOT NULL column rejects it) and it is unchanged.
+    fn bindArgsExec(stmt: *c.sqlite3_stmt, argv: []const []const u8) Error!void {
         for (argv, 0..) |arg, i| {
             const idx: c_int = @intCast(i + 1);
             const rc = if (arg.len == 0)
                 c.sqlite3_bind_null(stmt, idx)
             else
                 sqlite3_bind_text_isize(@ptrCast(stmt), idx, arg.ptr, @intCast(arg.len), SQLITE_DESTRUCTOR_TRANSIENT);
+            if (rc != c.SQLITE_OK) return Error.BindFailed;
+        }
+    }
+
+    /// Bind `argv` for a READ: every argument is bound as TEXT, so an empty
+    /// slice is an empty STRING — not NULL.
+    ///
+    /// This asymmetry with `bindArgsExec` is deliberate and load-bearing.
+    /// `query` / `queryRow` have always bound this way, and callers rely on
+    /// it for the "optional filter" idiom:
+    ///
+    /// ```sql
+    /// SELECT … FROM t WHERE (? = '' OR id = ?)
+    /// ```
+    ///
+    /// with the unused filter passed as `""`. Under `bindArgsExec` that `""`
+    /// becomes NULL, `NULL = ''` is NULL rather than true, the WHERE clause
+    /// evaluates to NULL, and the query silently returns NO ROWS instead of
+    /// ignoring the filter. (`exec` binding `""` as NULL is the documented
+    /// write-side behaviour and stays.)
+    fn bindArgsText(stmt: *c.sqlite3_stmt, argv: []const []const u8) Error!void {
+        for (argv, 0..) |arg, i| {
+            const rc = sqlite3_bind_text_isize(@ptrCast(stmt), @intCast(i + 1), arg.ptr, @intCast(arg.len), SQLITE_DESTRUCTOR_TRANSIENT);
             if (rc != c.SQLITE_OK) return Error.BindFailed;
         }
     }
