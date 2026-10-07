@@ -241,6 +241,48 @@ pub const Error = error{
 /// `c` is a struct of manual `extern fn` declarations — also evaluated
 /// lazily because the struct field of the same name is referenced only
 /// when SqliteBackend is actually used.
+/// File descriptors one pooled reader holds, MEASURED (not guessed) by
+/// opening seven connections to one WAL database and reading the links
+/// under `/proc/self/fd`.
+///
+/// It is 2, not 3: each connection holds the database file and its `-wal`,
+/// but the `-shm` (the WAL index) is a single shared-memory segment per
+/// PROCESS per database file, so it is paid once for the whole pool rather
+/// than per reader.
+///
+/// Over-reserving would be the safe direction to err, so note that the cap
+/// below uses this figure directly: 100 readers ≈ 200 descriptors, plus
+/// one `-shm`.
+pub const FDS_PER_READER: usize = 2;
+
+/// Descriptors reserved for everything that is NOT a pooled reader:
+/// listening sockets, one per connected SSE client, open source files,
+/// subprocess pipes. This has to be generous. A server that keeps a
+/// long-lived SSE stream per browser tab is already using hundreds before
+/// the database opens anything.
+pub const FD_HEADROOM: usize = 256;
+
+/// How many readers this process can afford, derived from its actual
+/// `RLIMIT_NOFILE` rather than from a guess.
+///
+/// This is the hard ceiling the reader pool obeys even when
+/// `Config.max_read_conns == 0`. "Unlimited" has to mean "bounded by the
+/// resource", not "bounded by nothing": a pooled reader costs
+/// `FDS_PER_READER` descriptors, and when the process runs out,
+/// `sqlite3_open` returns SQLITE_CANTOPEN and the failure surfaces as
+/// `unable to open database file` on a `PRAGMA journal_mode = WAL` — which
+/// reads like a permissions or path problem and is neither.
+pub fn fdDerivedReaderCap() usize {
+    if (builtin.os.tag == .windows) return 32; // no RLIMIT_NOFILE to read
+    // `cur` is the SOFT limit — the one actually enforced, and the one a
+    // `ulimit -n` in a launcher script would have lowered.
+    const lim = std.posix.getrlimit(std.posix.rlimit_resource.NOFILE) catch return 32;
+    const soft = @as(usize, @intCast(lim.cur));
+    if (soft <= FD_HEADROOM) return 1;
+    const affordable = (soft - FD_HEADROOM) / FDS_PER_READER;
+    return @max(affordable, 1);
+}
+
 pub const SqliteBackend = struct {
     const c = @cImport(@cInclude("sqlite3.h"));
 
@@ -451,8 +493,13 @@ pub const SqliteBackend = struct {
             self.cfg = cfg;
         }
 
-        fn path(self: *ReaderPool) [:0]const u8 {
-            return self.db_path orelse unreachable; // guarded by `enabled`
+        /// The database path this pool opens readers against.
+        ///
+        /// An error rather than an `unreachable`: `closeAll` clears
+        /// `db_path`, so a `claim` racing shutdown would otherwise turn a
+        /// shutdown-ordering bug into a panic.
+        fn path(self: *ReaderPool) Error![:0]const u8 {
+            return self.db_path orelse Error.DatabaseNotFound;
         }
 
         /// Open up to `n` readers now so a burst does not each pay for a
@@ -462,11 +509,14 @@ pub const SqliteBackend = struct {
             defer self.mutex.unlock(io);
             var i: usize = 0;
             while (i < n) : (i += 1) {
-                if (self.cfg.max_read_conns != 0 and self.slots.items.len >= self.cfg.max_read_conns) break;
+                if (self.atCap()) break;
                 const slot = alloc.create(SqliteBackend) catch return Error.OutOfMemory;
-                // `pool = .{}` — a reader never nests a pool of its own.
                 slot.* = .{};
-                openSingle(slot, io, self.path(), self.cfg) catch |err| {
+                // Same reason as `openSlot`: `applyConfig` can fail after
+                // the handle is assigned, so the handle needs closing.
+                const db_path = try self.path();
+                openSingle(slot, io, db_path, self.cfg) catch |err| {
+                    slot.deinit();
                     alloc.destroy(slot);
                     return err;
                 };
@@ -475,29 +525,53 @@ pub const SqliteBackend = struct {
             }
         }
 
+        /// Open one more reader.
+        ///
+        /// ONE cleanup path, deliberately. An `errdefer` fires on EVERY
+        /// error return, so pairing it with an explicit `alloc.destroy` on
+        /// any one of those paths is a double free — which is exactly what
+        /// this function used to do, and it only surfaced under fd
+        /// exhaustion, because that is what makes the error paths run.
         fn openSlot(self: *ReaderPool, io: std.Io) !*SqliteBackend {
             const slot = alloc.create(SqliteBackend) catch return Error.OutOfMemory;
-            errdefer alloc.destroy(slot);
             // `pool = .{}` — a reader never nests a pool of its own.
             slot.* = .{};
-            openSingle(slot, io, self.path(), self.cfg) catch |err| {
-                alloc.destroy(slot);
-                return err;
-            };
+            // `deinit`, not a bare `alloc.destroy`: `openSingle` can fail
+            // AFTER assigning `slot.db` (it is `applyConfig` that fails,
+            // and that runs last), so the sqlite handle must be closed or
+            // its fds leak for the life of the process. `deinit` is safe on
+            // a half-open backend — every step null-checks first.
+            errdefer alloc.destroy(slot);
+            errdefer slot.deinit();
+            openSingle(slot, io, try self.path(), self.cfg) catch |err| return err;
+
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
-            if (self.cfg.max_read_conns != 0 and self.slots.items.len >= self.cfg.max_read_conns) {
-                slot.deinit();
-                alloc.destroy(slot);
-                return error.PoolExhausted;
-            }
+            if (self.atCap()) return error.PoolExhausted;
             try self.slots.append(alloc, slot);
             return slot;
         }
 
+        /// True when the pool must not open another reader.
+        ///
+        /// `Config.max_read_conns` is the POLICY cap, and 0 means "no
+        /// policy cap" — but there is still a hard ceiling, because a
+        /// pooled reader costs `FDS_PER_READER` file descriptors and the
+        /// consumer process needs those for its own sockets. A long-lived
+        /// server that fans out one fd per SSE client WILL run the process
+        /// out of descriptors otherwise, at which point `sqlite3_open`
+        /// returns SQLITE_CANTOPEN and every read that needs a new reader
+        /// fails with "unable to open database file".
+        fn atCap(self: *ReaderPool) bool {
+            if (self.cfg.max_read_conns != 0 and self.slots.items.len >= self.cfg.max_read_conns) {
+                return true;
+            }
+            return self.slots.items.len >= fdDerivedReaderCap();
+        }
+
         /// Take exclusive ownership of a reader, opening one if every
         /// existing reader is busy. Never blocks on another read.
-        fn claim(self: *ReaderPool, io: std.Io) Error!*SqliteBackend {
+        pub fn claim(self: *ReaderPool, io: std.Io) Error!*SqliteBackend {
             try self.mutex.lock(io);
             if (self.idle.pop()) |idx| {
                 self.mutex.unlock(io);
@@ -509,7 +583,7 @@ pub const SqliteBackend = struct {
 
         /// Hand a reader back. Call ONLY once its statement has been reset
         /// or finalized, so the next read starts a fresh snapshot.
-        fn release(self: *ReaderPool, io: std.Io, slot: *SqliteBackend) void {
+        pub fn release(self: *ReaderPool, io: std.Io, slot: *SqliteBackend) void {
             // The index lookup reads `slots.items`, so it MUST happen under
             // the mutex: a concurrent `claim` → `openSlot` can reallocate
             // that slice, and scanning the stale pointer is undefined.
@@ -557,6 +631,26 @@ pub const SqliteBackend = struct {
     /// True when reads can be served by a pooled reader.
     fn poolReady(self: *SqliteBackend) bool {
         return self.pool.enabled;
+    }
+
+    /// Take a reader for one read, or fall back to `self`.
+    ///
+    /// NEVER returns an error. A read that fails because the pool could not
+    /// grow is strictly worse than a read that queues behind a write: the
+    /// first is a 500 the caller sees, the second is the pre-pooling
+    /// behaviour and is merely slower. The pool runs out of capacity for
+    /// reasons that have nothing to do with whether this particular read
+    /// can be answered — most often descriptors, which is exactly why the
+    /// exhaustion showed up as `unable to open database file` on a
+    /// `PRAGMA` rather than as anything that looked like a database error.
+    fn claimReader(self: *SqliteBackend) *SqliteBackend {
+        return self.pool.claim(self.io) catch |err| {
+            std.log.warn(
+                "sqlite: reader pool unavailable ({s}); serving this read on the write connection",
+                .{@errorName(err)},
+            );
+            return self;
+        };
     }
 
     /// Re-apply `cfg` to an already-open connection. Needs no allocator:
@@ -803,7 +897,12 @@ pub const SqliteBackend = struct {
             defer self.mutex.unlock(self.io);
             return executeQueryRow(self, allocator, sql, argv);
         }
-        const slot = try self.pool.claim(self.io);
+        const slot = self.claimReader();
+        if (slot == self) {
+            try self.mutex.lock(self.io);
+            defer self.mutex.unlock(self.io);
+            return executeQueryRow(self, allocator, sql, argv);
+        }
         defer self.pool.release(self.io, slot);
         try slot.mutex.lock(slot.io);
         defer slot.mutex.unlock(slot.io);
@@ -1238,7 +1337,14 @@ pub const SqliteBackend = struct {
             defer self.mutex.unlock(self.io);
             return executeQueryMaybeCached(self, allocator, sql, argv);
         }
-        const slot = try self.pool.claim(self.io);
+        const slot = self.claimReader();
+        if (slot == self) {
+            // Pool could not grow: serve the read on the write connection,
+            // which is shared — so take the cached-statement guard.
+            try self.mutex.lock(self.io);
+            defer self.mutex.unlock(self.io);
+            return executeQueryMaybeCached(self, allocator, sql, argv);
+        }
         errdefer self.pool.release(self.io, slot);
         try slot.mutex.lock(slot.io);
         defer slot.mutex.unlock(slot.io);
