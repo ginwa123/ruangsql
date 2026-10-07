@@ -519,7 +519,19 @@ pub fn build(b: *std.Build) void {
     // block. The mod already carries link_libc + (system or vendored)
     // sqlite3 amalgamation, so test executables inherit those deps
     // automatically.
-    const mod_tests = b.addTest(.{ .root_module = mod });
+    // `-Dtest-filter=<substr>` — Zig 0.16 moved test filtering to BUILD
+    // time (`AddTestOptions.filters`); the generated test runner no longer
+    // parses `--test-filter` from its own command line, so
+    // `zig build test -- --test-filter=…` aborts. Mirrors kabelweb's
+    // `zig build test -Dtest-filter=<substr>`.
+    const test_filter = b.option(
+        []const u8,
+        "test-filter",
+        "Only run tests whose name contains this substring",
+    ) orelse "";
+    const test_filters: []const []const u8 = if (test_filter.len > 0) &.{test_filter} else &.{};
+
+    const mod_tests = b.addTest(.{ .root_module = mod, .filters = test_filters });
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run databases package tests");
     test_step.dependOn(&run_mod_tests.step);

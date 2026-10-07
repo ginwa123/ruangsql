@@ -119,6 +119,39 @@ pub const Config = struct {
     synchronous: Synchronous = .full,
     journal_size_limit_bytes: i64 = 64 * 1024 * 1024,
     wal_autocheckpoint_pages: u32 = 1_000,
+    /// Page cache for THIS connection, in KiB (`PRAGMA cache_size = -N`,
+    /// i.e. a size in KiB rather than a page count). Default 8 MiB — SQLite
+    /// ships 2 MiB, which is small for a table that is read on every
+    /// request. 0 leaves SQLite's own default in place.
+    ///
+    /// The cache is per connection, so a pool of N connections spends
+    /// N × this if you open several connections by hand.
+    cache_size_kb: u32 = 8_000,
+    /// Extra READ connections `init` opens alongside the primary one.
+    ///
+    /// WAL gives a database file MANY concurrent readers and exactly ONE
+    /// writer. A single connection therefore serialises every read behind
+    /// one mutex — a read queued behind a write waits for the whole write,
+    /// and reads never use more than one core. Opening readers makes them
+    /// genuinely parallel; writers keep using the primary connection, which
+    /// is the only one SQLite allows to write anyway.
+    ///
+    /// 0 = no pooling (exactly the old single-connection behaviour).
+    /// Default 7 → 8 connections total, sized to a typical 2–8 core
+    /// runtime.
+    read_conns: usize = 7,
+    /// `PRAGMA mmap_size` in bytes: read the database through a memory
+    /// mapping instead of `read()`. 0 leaves SQLite's default (no mmap).
+    ///
+    /// Trades page-cache accounting for syscalls: pages still come from
+    /// the OS file cache, but each page hit skips a syscall and a copy.
+    /// It is not extra anonymous memory, so it does not count against a
+    /// container's `memory.max` the way `cache_size` does.
+    ///
+    /// Default 256 MiB of window: a single mapping, only as many pages as
+    /// the database actually has are ever resident, so a generous cap is
+    /// free. Set 0 to leave SQLite's own default (no mmap).
+    mmap_size_bytes: u64 = 256 * 1024 * 1024,
 };
 
 /// What `readConfig` observed on the connection. Printed by consumers at
@@ -208,6 +241,31 @@ pub const SqliteBackend = struct {
     /// `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` (depth >= 1).
     transaction_depth: u32 = 0,
 
+    /// Per-connection prepared-statement cache. Filled by `exec` /
+    /// `queryRow` on first use of each SQL text.
+    stmt_cache: StmtCache = .{},
+
+    /// Extra READ-ONLY connections opened by `init`. Empty when
+    /// `Config.read_conns == 0`, in which case every statement runs on this
+    /// backend's own connection (the historical behaviour).
+    ///
+    /// These are ordinary `SqliteBackend`s with `readers == &.{}`, which is
+    /// what keeps the type from recursing.
+    readers: []SqliteBackend = &.{},
+    /// True while a `Rows` from `query` is stepping this connection's
+    /// CACHED statement.
+    ///
+    /// `query` hands its statement to the caller and returns, so the same
+    /// SQL text can be live twice on one connection. The second caller then
+    /// gets a one-shot statement instead of the cached one — correct, just
+    /// not amortised. A caller that leaks an iterator therefore only costs
+    /// that connection its statement caching; it never blocks it.
+    iterating: std.atomic.Value(bool) = .init(false),
+    /// Round-robin cursor over `readers`. Reads take no lock on the way in:
+    /// each read picks the next connection and only contends with the other
+    /// readers that happen to hash to the same slot.
+    reader_rr: std.atomic.Value(usize) = .init(0),
+
     /// Open `db_path` with the default `Config`. Same as
     /// `initWithConfig(io, db_path, .{})`.
     pub fn init(self: *SqliteBackend, io: std.Io, db_path: [:0]const u8) Error!void {
@@ -227,7 +285,47 @@ pub const SqliteBackend = struct {
         db_path: [:0]const u8,
         cfg: Config,
     ) Error!void {
-        self.io = io;
+        try openSingle(self, io, db_path, cfg);
+
+        // Reads get their own connections. Best-effort: if the extra
+        // connections cannot be opened, the backend still works exactly
+        // like the single-connection version rather than failing to start.
+        if (cfg.read_conns == 0) return;
+        // An in-memory database belongs to the CONNECTION that opened it:
+        // a second connection would see an empty, unrelated database. So
+        // `:memory:` (and an unshared `file::memory:`) always stays on one
+        // connection — which is also what every `:memory:` test expects.
+        if (isInMemoryPath(db_path)) return;
+        const alloc = std.heap.smp_allocator;
+        const slots = alloc.alloc(SqliteBackend, cfg.read_conns) catch {
+            std.log.warn("sqlite: could not allocate {d} reader connections; running single-connection", .{cfg.read_conns});
+            return;
+        };
+        var opened: usize = 0;
+        for (slots) |*slot| {
+            slot.* = .{ .readers = &.{} }; // never nests a pool
+            openSingle(slot, io, db_path, cfg) catch |err| {
+                std.log.warn("sqlite: reader connection {d} failed ({s}); continuing with {d}", .{ opened, @errorName(err), opened });
+                break;
+            };
+            opened += 1;
+        }
+        if (opened == 0) {
+            alloc.free(slots);
+            return;
+        }
+        self.readers = slots[0..opened];
+    }
+
+    /// Open one connection and apply `cfg` to it. No pooling — the
+    /// building block for both the primary connection and the readers.
+    fn openSingle(
+        slot: *SqliteBackend,
+        io: std.Io,
+        db_path: [:0]const u8,
+        cfg: Config,
+    ) Error!void {
+        slot.io = io;
         var db: ?*c.sqlite3 = null;
         const rc = c.sqlite3_open(db_path.ptr, &db);
         if (rc != c.SQLITE_OK) {
@@ -240,8 +338,56 @@ pub const SqliteBackend = struct {
                 else => error.OpenFailed,
             };
         }
-        self.db = db;
-        try self.applyConfig(cfg);
+        slot.db = db;
+        try slot.applyConfig(cfg);
+    }
+
+    /// True for the SQLite spellings of a private, connection-local
+    /// in-memory database.
+    fn isInMemoryPath(db_path: []const u8) bool {
+        if (std.mem.eql(u8, db_path, ":memory:")) return true;
+        // `file::memory:...` is in-memory too; if it carries
+        // `cache=shared` the connections would share one database, but
+        // pooling a shared-cache memory DB buys nothing, so skip it.
+        if (std.mem.startsWith(u8, db_path, "file::memory:")) return true;
+        return false;
+    }
+
+    /// True for SQL that inspects CONNECTION state rather than table data.
+    ///
+    /// `last_insert_rowid()`, `changes()` and `total_changes()` are
+    /// per-connection counters. A reader connection has never written
+    /// anything, so it would answer `0` — silently wrong. These statements
+    /// therefore have to stay on the connection that did the write.
+    ///
+    /// This is the one thing pooling cannot make transparent by routing
+    /// alone, so it is decided by name. The check is a case-insensitive
+    /// substring scan over a handful of needles, and only ever runs for a
+    /// statement that is already a read.
+    fn needsWriteConnection(sql: []const u8) bool {
+        const needles = [_][]const u8{ "last_insert_rowid", "total_changes", "changes(" };
+        for (needles) |needle| {
+            if (containsIgnoreCase(sql, needle)) return true;
+        }
+        return false;
+    }
+
+    fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+        if (needle.len == 0 or haystack.len < needle.len) return false;
+        var i: usize = 0;
+        const last = haystack.len - needle.len;
+        while (i <= last) : (i += 1) {
+            if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+        }
+        return false;
+    }
+
+    /// Connection a read-only statement should run on: the next reader, or
+    /// this backend itself when pooling is off.
+    fn readSlot(self: *SqliteBackend) *SqliteBackend {
+        if (self.readers.len == 0) return self;
+        const i = self.reader_rr.fetchAdd(1, .monotonic) % self.readers.len;
+        return &self.readers[i];
     }
 
     /// Re-apply `cfg` to an already-open connection. Needs no allocator:
@@ -265,6 +411,20 @@ pub const SqliteBackend = struct {
         try self.execPragma(sync);
         try self.execPragma(auto_ckpt);
         try self.execPragma(size_limit);
+
+        // Sizing knobs. Both default ON (8 MiB cache, 256 MiB mmap window)
+        // because the defaults are what a caller gets for free; set either
+        // to 0 to hand the decision back to SQLite.
+        if (cfg.cache_size_kb != 0) {
+            var cache_buf: [64]u8 = undefined;
+            const cache = std.fmt.bufPrint(cache_buf[0..], "PRAGMA cache_size = -{d}", .{cfg.cache_size_kb}) catch return Error.ExecuteFailed;
+            try self.execPragma(cache);
+        }
+        if (cfg.mmap_size_bytes != 0) {
+            var mmap_buf: [64]u8 = undefined;
+            const mmap = std.fmt.bufPrint(mmap_buf[0..], "PRAGMA mmap_size = {d}", .{cfg.mmap_size_bytes}) catch return Error.ExecuteFailed;
+            try self.execPragma(mmap);
+        }
     }
 
     /// `exec` with no allocator: `executeStatement` never touches the
@@ -326,33 +486,35 @@ pub const SqliteBackend = struct {
         // level (callers don't need to special-case "" themselves).
         if (sql.len == 0) return;
 
-        var stmt: ?*c.sqlite3_stmt = null;
-        var rc = c.sqlite3_prepare_v2(db, sql.ptr, @intCast(sql.len), &stmt, null);
-        defer {
-            if (stmt) |s| {
-                _ = c.sqlite3_finalize(s);
+        const cached = cacheableSql(sql);
+        const stmt = if (cached)
+            self.stmt_cache.acquire(db, sql) catch |err| {
+                const err_msg = c.sqlite3_errmsg(db);
+                std.log.info("sqlite3 prepare failed: {s} (sql: {s})", .{ err_msg, sql });
+                return err;
             }
-        }
-        if (rc != c.SQLITE_OK) {
-            const err_msg = c.sqlite3_errmsg(db);
-            std.log.info("sqlite3 prepare failed: {s} (sql: {s})", .{ err_msg, sql });
-            return Error.PrepareFailed;
-        }
+        else
+            prepareOneShot(db, sql) catch |err| {
+                const err_msg = c.sqlite3_errmsg(db);
+                std.log.info("sqlite3 prepare failed: {s} (sql: {s})", .{ err_msg, sql });
+                return err;
+            };
+        // ALWAYS close the statement before returning. A statement left at
+        // SQLITE_ROW keeps an implicit READ TRANSACTION open on the
+        // connection, and an open read transaction makes a following
+        // `BEGIN IMMEDIATE` fail with SQLITE_BUSY *without* consulting
+        // busy_timeout — it cannot upgrade the snapshot. `reset` ends it
+        // (and hands a cached statement back ready for the next bind).
+        defer if (cached) {
+            _ = c.sqlite3_reset(stmt);
+        } else {
+            _ = c.sqlite3_finalize(stmt);
+        };
 
-        for (argv, 0..) |arg, i| {
-            const param_idx: c_int = @intCast(i + 1);
-            if (arg.len == 0) {
-                rc = c.sqlite3_bind_null(stmt, param_idx);
-            } else {
-                rc = sqlite3_bind_text_isize(@ptrCast(stmt), param_idx, arg.ptr, @intCast(arg.len), SQLITE_DESTRUCTOR_TRANSIENT);
-            }
-            if (rc != c.SQLITE_OK) {
-                return Error.BindFailed;
-            }
-        }
+        try bindArgs(stmt, argv);
 
         while (true) {
-            rc = c.sqlite3_step(stmt);
+            const rc = c.sqlite3_step(stmt);
             if (rc == c.SQLITE_ROW) {
                 continue;
             } else if (rc == c.SQLITE_DONE) {
@@ -363,6 +525,40 @@ pub const SqliteBackend = struct {
                 return Error.ExecuteFailed;
             }
         }
+    }
+
+    /// Read `stmt`'s current row into an allocator-owned `Row`, in TWO
+    /// allocations: the `values` slice, and one buffer holding every
+    /// column's bytes back to back.
+    ///
+    /// The naive version allocated once per column, so a 3-column row cost
+    /// four allocator calls and the same number of frees — on a path that
+    /// runs per request and, for a list endpoint, per ROW. Callers see the
+    /// same `Row.values` shape and the same `Row.deinit` contract.
+    ///
+    /// SQL NULL still maps to an empty slice, as everywhere else here.
+    fn readRowPacked(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, col_count: usize) Error!Row {
+        const values = allocator.alloc([]u8, col_count) catch return Error.OutOfMemory;
+        errdefer allocator.free(values);
+
+        var total: usize = 0;
+        for (0..col_count) |i| {
+            total += @intCast(c.sqlite3_column_bytes(stmt, @intCast(i)));
+        }
+        const data = allocator.alloc(u8, total) catch return Error.OutOfMemory;
+        errdefer allocator.free(data);
+
+        var off: usize = 0;
+        for (0..col_count) |i| {
+            const len: usize = @intCast(c.sqlite3_column_bytes(stmt, @intCast(i)));
+            if (c.sqlite3_column_text(stmt, @intCast(i))) |text| {
+                @memcpy(data[off .. off + len], text[0..len]);
+            }
+            values[i] = data[off .. off + len];
+            off += len;
+        }
+
+        return .{ .values = values, .arena = data };
     }
 
     pub fn exec(self: *SqliteBackend, allocator: std.mem.Allocator, sql: []const u8, argv: []const []const u8) Error!void {
@@ -382,46 +578,35 @@ pub const SqliteBackend = struct {
     ) Error!Row {
         const db = self.db orelse return Error.DatabaseNotFound;
 
-        var stmt: ?*c.sqlite3_stmt = null;
-        const prep_rc = c.sqlite3_prepare_v2(db, sql.ptr, @intCast(sql.len), &stmt, null);
-        if (prep_rc != c.SQLITE_OK) {
-            return Error.PrepareFailed;
-        }
-        defer _ = c.sqlite3_finalize(stmt);
+        const cached = cacheableSql(sql);
+        const stmt = if (cached) try self.stmt_cache.acquire(db, sql) else try prepareOneShot(db, sql);
+        defer if (cached) {
+            _ = c.sqlite3_reset(stmt);
+        } else {
+            _ = c.sqlite3_finalize(stmt);
+        };
 
-        for (argv, 0..) |arg, i| {
-            const bind_rc = sqlite3_bind_text_isize(@ptrCast(stmt), @intCast(i + 1), arg.ptr, @intCast(arg.len), SQLITE_DESTRUCTOR_TRANSIENT);
-            if (bind_rc != c.SQLITE_OK) {
-                return Error.BindFailed;
-            }
-        }
+        try bindArgs(stmt, argv);
 
         const step_rc = c.sqlite3_step(stmt);
         if (step_rc != c.SQLITE_ROW) {
             return Error.RowNotFound;
         }
 
-        const col_count = c.sqlite3_column_count(stmt);
-        var values = try allocator.alloc([]u8, @intCast(col_count));
-
-        for (0..@intCast(col_count)) |i| {
-            const col_text = c.sqlite3_column_text(stmt, @intCast(i));
-            if (col_text) |text| {
-                const len = c.sqlite3_column_bytes(stmt, @intCast(i));
-                values[i] = try allocator.alloc(u8, @intCast(len));
-                @memcpy(values[i][0..@intCast(len)], text[0..@intCast(len)]);
-            } else {
-                values[i] = try allocator.alloc(u8, 0);
-            }
-        }
-
-        return Row{ .values = values };
+        const col_count: usize = @intCast(c.sqlite3_column_count(stmt));
+        return readRowPacked(allocator, stmt, col_count);
     }
 
     pub fn queryRow(self: *SqliteBackend, allocator: std.mem.Allocator, sql: []const u8, argv: []const []const u8) Error!Row {
-        try self.mutex.lock(self.io);
-        defer self.mutex.unlock(self.io);
-        return executeQueryRow(self, allocator, sql, argv);
+        // Reads run on a reader connection when `init` opened any, which is
+        // what stops a read from queueing behind a write on the primary
+        // connection. A `Transaction` still reads through the primary
+        // connection (via `tx.queryRow`) so it sees its own uncommitted
+        // writes.
+        const slot = if (needsWriteConnection(sql)) self else self.readSlot();
+        try slot.mutex.lock(slot.io);
+        defer slot.mutex.unlock(slot.io);
+        return executeQueryRow(slot, allocator, sql, argv);
     }
 
     pub const Rows = struct {
@@ -432,6 +617,12 @@ pub const SqliteBackend = struct {
         /// `sqlite3_step()` returns an error — the stmt pointer alone
         /// does not give access to the db handle. See `captureError`.
         db: ?*c.sqlite3,
+        /// Player that owns the cached statement, when this iterator came
+        /// from `query` (see `SqliteBackend.iterating`).
+        slot: ?*SqliteBackend = null,
+        /// True when `stmt` belongs to the statement cache: `deinit` resets
+        /// it for reuse instead of finalizing it.
+        cached: bool = false,
         /// Tracks whether the iterator has reached SQLITE_DONE so that
         /// subsequent `next()` calls short-circuit to null without
         /// re-invoking `sqlite3_step()`. See `next` for the rationale.
@@ -450,8 +641,17 @@ pub const SqliteBackend = struct {
                 self.last_error_msg = null;
             }
             if (self.stmt) |s| {
-                _ = c.sqlite3_finalize(s);
+                if (self.cached) {
+                    // Hand the statement back reset, and reopen the slot for
+                    // the next cached iterator.
+                    _ = c.sqlite3_reset(s);
+                    if (self.slot) |slot| slot.iterating.store(false, .release);
+                } else {
+                    _ = c.sqlite3_finalize(s);
+                }
             }
+            self.stmt = null;
+            self.slot = null;
         }
 
         /// Capture `sqlite3_errmsg(db)` into `last_error_msg` so callers
@@ -502,30 +702,33 @@ pub const SqliteBackend = struct {
                 return Error.QueryFailed;
             }
 
-            const col_count = c.sqlite3_column_count(self.stmt);
-            const values = self.allocator.alloc([]u8, @intCast(col_count)) catch return Error.OutOfMemory;
-
-            for (0..@intCast(col_count)) |i| {
-                const col_text = c.sqlite3_column_text(self.stmt, @intCast(i));
-                if (col_text) |text| {
-                    const len = c.sqlite3_column_bytes(self.stmt, @intCast(i));
-                    values[i] = self.allocator.alloc(u8, @intCast(len)) catch return Error.OutOfMemory;
-                    @memcpy(values[i][0..@intCast(len)], text[0..@intCast(len)]);
-                } else {
-                    values[i] = self.allocator.alloc(u8, 0) catch return Error.OutOfMemory;
-                }
-            }
-
-            return Row{ .values = values };
+            const stmt = self.stmt orelse return Error.DatabaseNotFound;
+            const col_count: usize = @intCast(c.sqlite3_column_count(stmt));
+            return try readRowPacked(self.allocator, stmt, col_count);
         }
     };
 
     pub const Row = struct {
         values: [][]u8,
+        /// Backing buffer for the column bytes when the row was read with
+        /// the packed reader: every `values[i]` is a slice of THIS one
+        /// allocation, so `deinit` frees it once instead of walking the
+        /// columns. null means the columns own separate allocations.
+        ///
+        /// Why it exists: a 3-column row used to cost four allocator calls
+        /// (the values array plus one per column) on a path that runs once
+        /// per request. Two is the floor without hand-rolling alignment,
+        /// and it is what turns a 20-row list read from ~80 allocator calls
+        /// into ~40.
+        arena: ?[]u8 = null,
 
         pub fn deinit(self: Row, allocator: std.mem.Allocator) void {
-            for (self.values) |v| {
-                allocator.free(v);
+            if (self.arena) |buf| {
+                allocator.free(buf);
+            } else {
+                for (self.values) |v| {
+                    allocator.free(v);
+                }
             }
             allocator.free(self.values);
         }
@@ -743,6 +946,12 @@ pub const SqliteBackend = struct {
     ) Error!Rows {
         const db = self.db orelse return Error.DatabaseNotFound;
 
+        // NOT served from `stmt_cache`. A `Rows` keeps using its statement
+        // after this function unlocks, so a cached statement could be reset
+        // by a second `query` on the same connection while the first
+        // iterator is still mid-result. `exec` / `queryRow` finish inside
+        // the lock and are safe to cache; an iterator is not, so it keeps
+        // its own statement.
         var stmt: ?*c.sqlite3_stmt = null;
         const prep_rc = c.sqlite3_prepare_v2(db, sql.ptr, @intCast(sql.len), &stmt, null);
         if (prep_rc != c.SQLITE_OK) {
@@ -764,13 +973,210 @@ pub const SqliteBackend = struct {
         };
     }
 
-    pub fn query(self: *SqliteBackend, allocator: std.mem.Allocator, sql: []const u8, argv: []const []const u8) Error!Rows {
-        try self.mutex.lock(self.io);
-        defer self.mutex.unlock(self.io);
-        return executeQuery(self, allocator, sql, argv);
+    /// `query` body for a connection that may hand out its CACHED
+    /// statement. Falls back to a one-shot statement when the cache must
+    /// not be touched: a non-DML/SELECT text, or another iterator already
+    /// using this connection's cached statement. Caller holds the lock.
+    fn executeQueryMaybeCached(
+        slot: *SqliteBackend,
+        allocator: std.mem.Allocator,
+        sql: []const u8,
+        argv: []const []const u8,
+    ) Error!Rows {
+        const db = slot.db orelse return Error.DatabaseNotFound;
+        if (!cacheableSql(sql)) return executeQuery(slot, allocator, sql, argv);
+
+        if (slot.iterating.cmpxchgStrong(false, true, .acq_rel, .monotonic) != null) {
+            // Someone else is already stepping this connection's cached
+            // statement; a second live iterator needs its own.
+            return executeQuery(slot, allocator, sql, argv);
+        }
+        errdefer slot.iterating.store(false, .release);
+
+        const stmt = try slot.stmt_cache.acquire(db, sql);
+        try bindArgs(stmt, argv);
+        return Rows{
+            .allocator = allocator,
+            .stmt = stmt,
+            .db = db,
+            .slot = slot,
+            .cached = true,
+        };
     }
 
+    pub fn query(self: *SqliteBackend, allocator: std.mem.Allocator, sql: []const u8, argv: []const []const u8) Error!Rows {
+        // See `queryRow`: reads go to a reader connection, transactions stay
+        // on the primary one.
+        // The lock is released here, not in `Rows.deinit`. Holding it for
+        // the whole iteration would be faster (no two threads stepping one
+        // sqlite3 handle), but it would turn a caller that forgets
+        // `deinit` into a permanently stalled connection — and "you only
+        // leak a statement" is the contract existing callers were written
+        // against.
+        const slot = if (needsWriteConnection(sql)) self else self.readSlot();
+        try slot.mutex.lock(slot.io);
+        defer slot.mutex.unlock(slot.io);
+        return executeQueryMaybeCached(slot, allocator, sql, argv);
+    }
+
+    // ─── Prepared-statement cache ───────────────────────────────────────
+    //
+    // `exec` and `queryRow` used to `sqlite3_prepare_v2` + `sqlite3_finalize`
+    // on EVERY call. For a server that runs the same handful of statements
+    // per request, the parse + bytecode generation + teardown costs more
+    // than executing the statement — a point read spent most of its time
+    // re-compiling itself.
+    //
+    // Both now go through `stmt_cache`, keyed by SQL text, and the savings
+    // are transparent: `exec` / `queryRow` keep their exact signatures,
+    // semantics and ownership rules, so every existing caller speeds up
+    // without changing a line.
+    //
+    // `query` deliberately does NOT use the cache: a `Rows` iterator keeps
+    // stepping its statement AFTER `query` releases the mutex, so two live
+    // iterators on one connection would fight over a single cached
+    // statement. `exec` / `queryRow` complete inside the lock, which is
+    // what makes them safe to share.
+
+    /// Statements the cache is allowed to hold: a SELECT or a DML
+    /// statement (INSERT / UPDATE / DELETE / REPLACE).
+    ///
+    /// DDL and PRAGMA are deliberately excluded. Two reasons, both
+    /// observed rather than theoretical:
+    ///
+    ///   - Re-running DDL is an ERROR case (`CREATE TABLE` twice). With a
+    ///     cached statement the failure moves from prepare time to step
+    ///     time, which would silently change `Error.PrepareFailed` into
+    ///     `Error.ExecuteFailed` for existing callers.
+    ///   - A PRAGMA's result depends on connection state, so reusing one
+    ///     statement for it is not obviously equivalent.
+    ///
+    /// The statements that make a server hot — point reads, range reads,
+    /// inserts, updates, deletes — are all in. Leading `WITH` (a CTE) is
+    /// not recognised and simply runs uncached.
+    fn cacheableSql(sql: []const u8) bool {
+        var i: usize = 0;
+        while (i < sql.len and switch (sql[i]) {
+            ' ', '\t', '\n', '\r' => true,
+            else => false,
+        }) : (i += 1) {}
+        const rest = sql[i..];
+        const keywords = [_][]const u8{ "select", "insert", "update", "delete", "replace" };
+        for (keywords) |kw| {
+            if (rest.len < kw.len) continue;
+            var matches = true;
+            for (kw, 0..) |ch, j| {
+                if (std.ascii.toLower(rest[j]) != ch) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) return true;
+        }
+        return false;
+    }
+
+    /// Prepare a statement the cache must not keep (DDL / PRAGMA / anything
+    /// unrecognised). The caller finalizes it.
+    fn prepareOneShot(db: *c.sqlite3, sql: []const u8) Error!*c.sqlite3_stmt {
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(db, sql.ptr, @intCast(sql.len), &stmt, null);
+        if (rc != c.SQLITE_OK) return Error.PrepareFailed;
+        return stmt.?;
+    }
+
+    /// Bind `argv` positionally onto an already-reset statement. An empty
+    /// slice binds SQL NULL — the package-wide convention.
+    fn bindArgs(stmt: *c.sqlite3_stmt, argv: []const []const u8) Error!void {
+        for (argv, 0..) |arg, i| {
+            const idx: c_int = @intCast(i + 1);
+            const rc = if (arg.len == 0)
+                c.sqlite3_bind_null(stmt, idx)
+            else
+                sqlite3_bind_text_isize(@ptrCast(stmt), idx, arg.ptr, @intCast(arg.len), SQLITE_DESTRUCTOR_TRANSIENT);
+            if (rc != c.SQLITE_OK) return Error.BindFailed;
+        }
+    }
+
+    /// Per-connection cache of prepared statements, keyed by SQL text.
+    ///
+    /// Entries live until `SqliteBackend.deinit`. A cached statement is
+    /// handed to exactly one caller at a time (the backend mutex is what
+    /// guarantees that) and `acquire` resets it before returning.
+    ///
+    /// The SQL text is duplicated as the map key, so callers may pass a
+    /// temporary / stack / per-request-arena slice.
+    ///
+    /// The keys are tiny (one copy of each distinct statement a caller
+    /// uses) and there are a handful per connection, so the cache owns them
+    /// through `std.heap.smp_allocator` — a thread-safe allocator with no
+    /// deinit obligation. That keeps `init`'s signature (and therefore
+    /// every existing call site) unchanged.
+    const StmtCache = struct {
+        map: std.StringHashMapUnmanaged(*c.sqlite3_stmt) = .empty,
+
+        const allocator: std.mem.Allocator = std.heap.smp_allocator;
+
+        /// Finalize every cached statement. Called by `deinit`.
+        pub fn deinit(self: *StmtCache) void {
+            var it = self.map.iterator();
+            while (it.next()) |entry| {
+                _ = c.sqlite3_finalize(entry.value_ptr.*);
+                allocator.free(entry.key_ptr.*);
+            }
+            self.map.deinit(allocator);
+            self.map = .empty;
+        }
+
+        /// How many distinct statements this connection has cached.
+        pub fn count(self: *const StmtCache) usize {
+            return self.map.count();
+        }
+
+        /// Hand out the statement for `sql`, reset and ready to bind.
+        /// Prepares + caches it on first use.
+        fn acquire(self: *StmtCache, db: *c.sqlite3, sql: []const u8) Error!*c.sqlite3_stmt {
+            if (self.map.get(sql)) |stmt| {
+                _ = c.sqlite3_reset(stmt);
+                _ = c.sqlite3_clear_bindings(stmt);
+                return stmt;
+            }
+            var stmt: ?*c.sqlite3_stmt = null;
+            // SQLITE_PREPARE_PERSISTENT tells the planner this text will be
+            // reused; without it SQLite avoids caching lookaside buffers
+            // (it assumes the statement is short-lived).
+            const rc = c.sqlite3_prepare_v3(
+                db,
+                sql.ptr,
+                @intCast(sql.len),
+                c.SQLITE_PREPARE_PERSISTENT,
+                &stmt,
+                null,
+            );
+            if (rc != c.SQLITE_OK) return Error.PrepareFailed;
+            const key = allocator.dupe(u8, sql) catch {
+                _ = c.sqlite3_finalize(stmt);
+                return Error.OutOfMemory;
+            };
+            self.map.put(allocator, key, stmt.?) catch {
+                allocator.free(key);
+                _ = c.sqlite3_finalize(stmt);
+                return Error.OutOfMemory;
+            };
+            return stmt.?;
+        }
+    };
+
     pub fn deinit(self: *SqliteBackend) void {
+        // Reader connections are owned by this backend; close them with it.
+        if (self.readers.len > 0) {
+            for (self.readers) |*slot| slot.deinit();
+            std.heap.smp_allocator.free(self.readers.ptr[0..self.readers.len]);
+            self.readers = &.{};
+        }
+        // Finalize cached statements BEFORE closing the connection —
+        // sqlite3_finalize needs the statements to still be valid.
+        self.stmt_cache.deinit();
         if (self.db) |d| {
             _ = c.sqlite3_close(d);
         }
