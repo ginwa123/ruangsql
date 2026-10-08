@@ -154,7 +154,33 @@ pub const Config = struct {
     /// Set this only to bound memory: every pooled reader spends its own
     /// `cache_size_kb` of page cache and its own `mmap_size_bytes` of
     /// address space.
+    ///
+    /// MUST be at least `read_conns`, and a value at or below it is
+    /// treated as `read_conns` — the warm floor is opened at `init` and a
+    /// ceiling below the floor would make the two knobs contradict each
+    /// other, leaving the pool permanently unable to hand out the readers
+    /// it just opened. See `ReaderPool.effectiveCap`.
     max_read_conns: usize = 0,
+    /// How long a read waits for a pooled reader to come free before it
+    /// falls back to the primary connection. Default 5 s. 0 = never wait.
+    ///
+    /// A read that finds the pool at its ceiling used to be served by the
+    /// WRITE connection immediately. That is the worst available answer:
+    /// the write connection carries one mutex and one WAL writer slot, so
+    /// the read serializes against every concurrent write, and — because a
+    /// long read holds that mutex for its whole duration — it delays the
+    /// `BEGIN IMMEDIATE` of unrelated writers, which then burn their own
+    /// `busy_timeout` and fail with "database is locked".
+    ///
+    /// So the pool waits instead: `release` signals, and the waiting read
+    /// takes the reader the moment it is handed back. Only a reader that
+    /// cannot be obtained within this budget falls back, which is the
+    /// correct last resort — correct, and rare enough to log once.
+    ///
+    /// Sized like `busy_timeout_ms` on purpose: that is how long SQLite
+    /// itself will wait for a resource, so a read that gives up sooner than
+    /// a write would be giving up where the writer would not.
+    reader_wait_ms: u32 = 5_000,
     /// How long an idle reader above the warm floor may sit before the
     /// pool closes it. 0 = reap on the next `release` / `claim` /
     /// `reapIdle` pass. Default 60 s.
@@ -272,6 +298,23 @@ pub const FDS_PER_READER: usize = 2;
 /// the database opens anything.
 pub const FD_HEADROOM: usize = 256;
 
+/// How long a write-connection fallback stays quiet after it has been
+/// logged once.
+///
+/// The fallback is a property of the POOL being saturated, not of any one
+/// read: a burst that trips it prints one line per read, which buries the
+/// rest of the log and trains everyone to ignore the one line that says
+/// something is wrong. One line per interval keeps the signal.
+pub const FALLBACK_LOG_INTERVAL_MS: i64 = 60_000;
+
+/// Longest single park inside `ReaderPool.waitForReaderLocked`.
+///
+/// A waiter wakes on this slice even when nothing signalled it, so it
+/// re-reads the clock and can honour its budget. It is short enough that
+/// an idle reader handed back is picked up promptly, and long enough that
+/// a saturated pool does not spin.
+pub const MAX_WAIT_SLICE_MS: i64 = 250;
+
 /// How many readers this process can afford, derived from its actual
 /// `RLIMIT_NOFILE` rather than from a guess.
 ///
@@ -353,6 +396,15 @@ pub const SqliteBackend = struct {
     /// `sqlite3_clear_bindings` the statement a live iterator is stepping
     /// and rebind it to their own arguments.
     iterating: std.atomic.Value(bool) = .init(false),
+
+    /// Reads served on this backend's own connection because the reader
+    /// pool could not supply one. Read `readFallbackCount`.
+    fallbacks: std.atomic.Value(u64) = .init(0),
+
+    /// Monotonic timestamp (ms) of the last write-connection fallback
+    /// warning, so a saturated pool reports once per interval instead of
+    /// once per read.
+    fallback_logged_ms: std.atomic.Value(i64) = .init(0),
 
     /// Open `db_path` with the default `Config`. Same as
     /// `initWithConfig(io, db_path, .{})`.
@@ -473,11 +525,22 @@ pub const SqliteBackend = struct {
     const ReaderPool = struct {
         const alloc = std.heap.smp_allocator;
 
-        /// One open reader. `idle_since_ms` is null while claimed and set
-        /// to the monotonic clock (`std.Io.Timestamp`, `.awake`) when
-        /// returned to the idle list.
+        /// One open reader.
+        ///
+        /// `claimed` is the authority on who owns the connection, and
+        /// `idle_since_ms` is only its age stamp. They are NOT the same
+        /// fact, and conflating them was a use-after-free waiting to
+        /// happen: a duplicated `idle` entry (two `release` calls for one
+        /// connection) let `claim` hand the SAME connection to two reads,
+        /// and the loser of that race could have its connection closed and
+        /// freed by `reapLocked` while its `Rows` was still stepping it.
+        /// Keeping `claimed` separate means a stale `idle` entry is
+        /// detectable as stale instead of being handed out.
         const Slot = struct {
             conn: *SqliteBackend,
+            claimed: bool = false,
+            /// Monotonic timestamp (`.awake` clock) at which this reader
+            /// was returned to the idle list; null when claimed.
             idle_since_ms: ?i64 = null,
         };
 
@@ -497,6 +560,17 @@ pub const SqliteBackend = struct {
         /// Guards `slots` / `idle` structure only. Held briefly — never
         /// across a statement — so it is not the read hot path's limiter.
         mutex: std.Io.Mutex = .init,
+        /// Bumped by `release` / `reapIdle` / `closeAll` so a read blocked
+        /// on a full pool re-checks the pool as soon as a reader comes
+        /// free.
+        ///
+        /// NOT `std.Io.Condition`: `Condition.wait` has no timeout, so a
+        /// `claimOrWait` built on it would wait forever whenever no reader
+        /// was ever released — the budget would only ever be checked
+        /// BETWEEN waits, and there is no second wake-up to get there. A
+        /// read that must be able to give up needs a bounded wait, which is
+        /// `futexWaitTimeout` over this word.
+        readers_epoch: std.atomic.Value(u32) = .init(0),
 
         fn enable(self: *ReaderPool, io: std.Io, db_path: [:0]const u8, cfg: Config) void {
             self.db_path = alloc.dupeZ(u8, db_path) catch {
@@ -574,8 +648,23 @@ pub const SqliteBackend = struct {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             if (self.atCap()) return error.PoolExhausted;
-            try self.slots.append(alloc, .{ .conn = conn, .idle_since_ms = null });
+            try self.slots.append(alloc, .{ .conn = conn, .claimed = true, .idle_since_ms = null });
             return conn;
+        }
+
+        /// The policy ceiling, or 0 when there is none.
+        ///
+        /// Never below `read_conns`. The warm floor is opened eagerly at
+        /// `init`, so a `max_read_conns` at or under it would make the pool
+        /// refuse to hand out connections it had just opened — and because
+        /// `prewarm` breaks on `atCap`, it would not even open them. The
+        /// two knobs are inputs to the same decision, so one of them has to
+        /// yield; clamping here keeps a misconfigured pair degrading to
+        /// "unbounded" (the pre-pooling behaviour) instead of to "no
+        /// readers at all", and `sqlite_pool_test.zig` pins it.
+        fn effectiveCap(self: *ReaderPool) usize {
+            if (self.cfg.max_read_conns == 0) return 0;
+            return @max(self.cfg.max_read_conns, self.cfg.read_conns);
         }
 
         /// True when the pool must not open another reader.
@@ -588,20 +677,49 @@ pub const SqliteBackend = struct {
         /// out of descriptors otherwise, at which point `sqlite3_open`
         /// returns SQLITE_CANTOPEN and every read that needs a new reader
         /// fails with "unable to open database file".
+        ///
+        /// HOW BIG IS THAT CEILING, THOUGH. On a machine whose soft
+        /// `RLIMIT_NOFILE` is the modern default of 524288 this returns
+        /// 262016 — which is not a ceiling on read concurrency, it is a
+        /// promise that the process will run out of memory first. The
+        /// honest bound on a burst is `max_idle_time_ms` reaping plus
+        /// `reader_wait_ms` queueing, not this number; keep it as the
+        /// backstop that stops the descriptor leak, and do not read
+        /// exhaustion of it as a workload limit.
         fn atCap(self: *ReaderPool) bool {
-            if (self.cfg.max_read_conns != 0 and self.slots.items.len >= self.cfg.max_read_conns) {
-                return true;
-            }
+            const cap = self.effectiveCap();
+            if (cap != 0 and self.slots.items.len >= cap) return true;
             return self.slots.items.len >= fdDerivedReaderCap();
+        }
+
+        /// Take an idle reader, if there is one. Caller holds `mutex`.
+        ///
+        /// A stale entry (out of range, or naming a slot that some other
+        /// path already handed out) is dropped rather than returned: handing
+        /// a CLAIMED connection to a second read is the one mistake this
+        /// pool cannot recover from, because the loser of that race keeps
+        /// stepping a statement on a connection the winner may close.
+        fn popIdleLocked(self: *ReaderPool) ?*SqliteBackend {
+            while (self.idle.pop()) |idx| {
+                if (idx >= self.slots.items.len) continue;
+                if (self.slots.items[idx].claimed) continue;
+                self.slots.items[idx].claimed = true;
+                self.slots.items[idx].idle_since_ms = null;
+                return self.slots.items[idx].conn;
+            }
+            return null;
         }
 
         /// Take exclusive ownership of a reader, opening one if every
         /// existing reader is busy. Never blocks on another read.
+        ///
+        /// This is the non-waiting form, kept for callers that must not
+        /// block (a `Transaction` already owns the primary mutex; a caller
+        /// inside an interrupt-free section). `SqliteBackend.queryRow` /
+        /// `query` use `claimOrWait` instead.
         pub fn claim(self: *ReaderPool, io: std.Io) Error!*SqliteBackend {
             try self.mutex.lock(io);
-            if (self.idle.pop()) |idx| {
-                self.slots.items[idx].idle_since_ms = null;
-                const conn = self.slots.items[idx].conn;
+            if (self.popIdleLocked()) |conn| {
                 self.mutex.unlock(io);
                 return conn;
             }
@@ -611,9 +729,103 @@ pub const SqliteBackend = struct {
             // never reaped — e.g. released when the pool was already at the
             // floor — still occupy slots. Reap first so a burst followed by
             // a lull does not grow the pool again before the last reap.
-            self.reapLocked(nowMs(io));
+            _ = self.reapLocked(nowMs(io));
             self.mutex.unlock(io);
             return self.openSlot(io);
+        }
+
+        /// Wake readers blocked on `claimOrWait`, so they re-check the pool.
+        ///
+        /// Safe to call with the mutex held or not; what matters is that
+        /// the change being announced is already visible in `slots` /
+        /// `idle`. `epoch` is bumped BEFORE the futex wake, which is what
+        /// closes the race: a waiter that sampled the old epoch either
+        /// already parked (and gets woken) or has not yet parked (and its
+        /// `futexWaitTimeout` returns immediately, because the word no
+        /// longer matches).
+        fn wakeReaders(self: *ReaderPool, io: std.Io) void {
+            _ = self.readers_epoch.fetchAdd(1, .release);
+            io.futexWake(u32, &self.readers_epoch.raw, std.math.maxInt(u32));
+        }
+
+        /// Block until a reader is released or `timeout_ms` elapses, then
+        /// re-take `mutex` and return. Caller holds `mutex` on entry and
+        /// holds it again on exit.
+        ///
+        /// Uncancelable, and bounded by the timeout rather than by a signal:
+        /// the whole point is that the caller eventually has to be able to
+        /// give up, and a cancel would leave the read with nowhere to
+        /// report the error.
+        fn waitForReaderLocked(self: *ReaderPool, io: std.Io, timeout_ms: i64) void {
+            if (timeout_ms <= 0) return;
+            // Sample BEFORE unlocking: sampling after would let a release
+            // land in between and go unnoticed until the next timeout.
+            const epoch = self.readers_epoch.load(.acquire);
+            self.mutex.unlock(io);
+            defer self.mutex.lockUncancelable(io);
+            io.futexWaitTimeout(
+                u32,
+                &self.readers_epoch.raw,
+                epoch,
+                .{ .duration = .{
+                    .raw = .{ .nanoseconds = @intCast(@min(timeout_ms, MAX_WAIT_SLICE_MS) * std.time.ns_per_ms) },
+                    .clock = .awake,
+                } },
+            ) catch {};
+        }
+
+        /// `claim`, but WAIT up to `budget_ms` for a reader to be released
+        /// when the pool is at its ceiling instead of failing at once.
+        ///
+        /// Why waiting is the right answer and the old failure was not: the
+        /// caller of a failed `claim` runs the read on the WRITE
+        /// connection, which serializes it against every concurrent write
+        /// and holds the single writer mutex for the read's whole duration
+        /// — delaying unrelated `BEGIN IMMEDIATE`s into their own
+        /// `busy_timeout`. Queueing behind another READ costs latency;
+        /// queueing behind the writer costs correctness. So: block for a
+        /// reader, and only give up when the budget runs out.
+        ///
+        /// Returns `error.PoolExhausted` when the budget expires with no
+        /// reader free, and any error `openSlot` would have raised
+        /// (shutdown raced the claim, the descriptor budget ran out).
+        ///
+        /// Never holds `mutex` while blocked, and never blocks without a
+        /// deadline: `waitForReaderLocked` drops the mutex for the duration
+        /// and returns on its own timeout, so the budget is checked on a
+        /// real clock rather than only when somebody happens to release a
+        /// reader.
+        pub fn claimOrWait(self: *ReaderPool, io: std.Io, budget_ms: u32) Error!*SqliteBackend {
+            // Fast path, no waiting at all: an idle reader, or room to grow.
+            if (self.claim(io)) |conn| {
+                return conn;
+            } else |err| switch (err) {
+                error.PoolExhausted => {},
+                else => return err,
+            }
+            if (budget_ms == 0) return error.PoolExhausted;
+
+            const deadline = nowMs(io) + @as(i64, budget_ms);
+            var locked = true;
+            try self.mutex.lock(io);
+            defer if (locked) self.mutex.unlock(io);
+
+            while (true) {
+                if (self.popIdleLocked()) |conn| return conn;
+                // Reap first: a reader that went idle long ago still holds
+                // its slot, and `atCap` counts slots, not free readers.
+                if (self.reapLocked(nowMs(io)) > 0) self.wakeReaders(io);
+                if (self.popIdleLocked()) |conn| return conn;
+                if (!self.atCap()) {
+                    // Room to grow — but `openSlot` locks the mutex itself.
+                    locked = false;
+                    self.mutex.unlock(io);
+                    return self.openSlot(io);
+                }
+                const remaining = deadline - nowMs(io);
+                if (remaining <= 0) return error.PoolExhausted;
+                self.waitForReaderLocked(io, remaining);
+            }
         }
 
         /// Hand a reader back. Call ONLY once its statement has been reset
@@ -623,20 +835,41 @@ pub const SqliteBackend = struct {
             // the mutex: a concurrent `claim` → `openSlot` can reallocate
             // that slice, and scanning the stale pointer is undefined.
             self.mutex.lock(io) catch return;
-            defer self.mutex.unlock(io);
-            const idx = self.indexOf(slot) orelse return;
-            self.slots.items[idx].idle_since_ms = nowMs(io);
-            self.idle.append(alloc, idx) catch {
-                // Out of memory for the idle index. Deliberately do NOT
-                // `swapRemove` the slot out of `slots` here: that would
-                // renumber every later index and silently hand the same
-                // connection to two readers. Keeping it claimed leaks one
-                // connection, which is the safe direction to fail.
-                self.slots.items[idx].idle_since_ms = null;
-                std.log.err("sqlite: reader pool lost an idle slot to OOM; leaking one connection", .{});
-                return;
+            const handed_back = blk: {
+                defer self.mutex.unlock(io);
+                const idx = self.indexOf(slot) orelse break :blk false;
+                if (!self.slots.items[idx].claimed) {
+                    // Already idle. A second `release` for the same
+                    // connection would put its index in `idle` a second
+                    // time, and the next `claim` would hand one connection
+                    // to two reads.
+                    break :blk false;
+                }
+                const stamp = nowMs(io);
+                self.slots.items[idx].claimed = false;
+                self.slots.items[idx].idle_since_ms = stamp;
+                self.idle.append(alloc, idx) catch {
+                    // Out of memory for the idle index. Deliberately do NOT
+                    // `swapRemove` the slot out of `slots` here: that would
+                    // renumber every later index and silently hand the same
+                    // connection to two readers. Keeping it claimed leaks
+                    // one connection, which is the safe direction to fail.
+                    self.slots.items[idx].claimed = true;
+                    self.slots.items[idx].idle_since_ms = null;
+                    std.log.err("sqlite: reader pool lost an idle slot to OOM; leaking one connection", .{});
+                    break :blk false;
+                };
+                // Reaping can free slots a waiter is blocked on, and
+                // `reapLocked` cannot signal: it runs with the mutex held
+                // and the condition is signalled here instead, once, after
+                // the whole critical section.
+                _ = self.reapLocked(stamp);
+                break :blk true;
             };
-            self.reapLocked(self.slots.items[idx].idle_since_ms.?);
+            // Announced after the entry is visible in `idle`: a woken waiter
+            // whose first act is to re-acquire the mutex has to find
+            // something to take, or it sleeps again having lost nothing.
+            if (handed_back) self.wakeReaders(io);
         }
 
         /// Close idle readers older than `max_idle_time_ms`, never dropping
@@ -645,15 +878,21 @@ pub const SqliteBackend = struct {
         /// and the `claim` slow path already call it inline.
         pub fn reapIdle(self: *ReaderPool, io: std.Io) void {
             self.mutex.lock(io) catch return;
-            defer self.mutex.unlock(io);
-            self.reapLocked(nowMs(io));
+            const reaped = self.reapLocked(nowMs(io));
+            self.mutex.unlock(io);
+            // Freeing slots is exactly what a read parked on `claimOrWait`
+            // is waiting for: without this it would sit out its whole
+            // budget and then fall back, while the pool had room.
+            if (reaped > 0) self.wakeReaders(io);
         }
 
         /// Caller must hold `mutex`. `now` is a parameter (not read inside)
         /// so `release` can pass the timestamp it just stamped without a
-        /// second clock read.
-        fn reapLocked(self: *ReaderPool, now: i64) void {
+        /// second clock read. Returns how many connections were closed, so
+        /// the caller can decide whether a waiter needs waking.
+        fn reapLocked(self: *ReaderPool, now: i64) usize {
             const floor = self.cfg.read_conns;
+            var reaped: usize = 0;
             var i: usize = 0;
             while (i < self.idle.items.len) {
                 if (self.slots.items.len <= floor) break;
@@ -665,9 +904,18 @@ pub const SqliteBackend = struct {
                     _ = self.idle.swapRemove(i);
                     continue;
                 }
+                if (self.slots.items[idx].claimed) {
+                    // A duplicated `idle` entry naming a connection some
+                    // other read already owns. Drop the entry; closing it
+                    // here would pull the connection out from under that
+                    // read's live `Rows`.
+                    _ = self.idle.swapRemove(i);
+                    continue;
+                }
                 const since = self.slots.items[idx].idle_since_ms orelse {
-                    // Claimed readers are never in `idle`, but if one ever
-                    // is, drop the entry rather than closing live work.
+                    // No age stamp means this slot was never handed back
+                    // through `release`. Treat it as claimed rather than
+                    // guess, and drop the entry.
                     _ = self.idle.swapRemove(i);
                     continue;
                 };
@@ -701,8 +949,10 @@ pub const SqliteBackend = struct {
                     }
                 }
                 self.slots.items.len -= 1;
+                reaped += 1;
                 // Do not advance `i`: `swapRemove` moved a new entry here.
             }
+            return reaped;
         }
 
         fn indexOf(self: *ReaderPool, slot: *SqliteBackend) ?usize {
@@ -726,10 +976,27 @@ pub const SqliteBackend = struct {
             if (self.db_path) |owned_path| alloc.free(owned_path);
             self.db_path = null;
             self.enabled = false;
+            // Wake every waiter: a read blocked in `claimOrWait` must not
+            // sit out its whole budget against a pool that no longer
+            // exists. `popIdleLocked` finds nothing and `openSlot` reports
+            // `DatabaseNotFound`, which the caller turns into a fallback.
+            self.wakeReaders(io);
         }
 
         pub fn count(self: *ReaderPool) usize {
             return self.slots.items.len;
+        }
+
+        /// How many readers are sitting in the idle list right now.
+        ///
+        /// Exposed because "the pool is at its ceiling" and "every reader
+        /// is busy" are different facts, and only the second one is
+        /// backpressure — a test that cannot see the difference cannot tell
+        /// a queued read from a hijacked writer.
+        pub fn idleCount(self: *ReaderPool) usize {
+            self.mutex.lock(self.io) catch return 0;
+            defer self.mutex.unlock(self.io);
+            return self.idle.items.len;
         }
     };
 
@@ -740,22 +1007,60 @@ pub const SqliteBackend = struct {
 
     /// Take a reader for one read, or fall back to `self`.
     ///
-    /// NEVER returns an error. A read that fails because the pool could not
-    /// grow is strictly worse than a read that queues behind a write: the
-    /// first is a 500 the caller sees, the second is the pre-pooling
-    /// behaviour and is merely slower. The pool runs out of capacity for
-    /// reasons that have nothing to do with whether this particular read
-    /// can be answered — most often descriptors, which is exactly why the
-    /// exhaustion showed up as `unable to open database file` on a
-    /// `PRAGMA` rather than as anything that looked like a database error.
+    /// NEVER returns an error. A read that cannot get a reader is strictly
+    /// better served on the write connection than refused: the first is a
+    /// 500 the caller sees, the second is the pre-pooling behaviour and is
+    /// merely slower. The pool runs out of capacity for reasons that have
+    /// nothing to do with whether this particular read can be answered —
+    /// most often descriptors, which is exactly why the exhaustion showed
+    /// up as `unable to open database file` on a `PRAGMA` rather than as
+    /// anything that looked like a database error.
+    ///
+    /// It WAITS first (`Config.reader_wait_ms`). That is the fix for the
+    /// warning this used to print once per read:
+    ///
+    ///     warning: sqlite: reader pool unavailable (PoolExhausted);
+    ///              serving this read on the write connection
+    ///
+    /// Every read that hit a full pool took the write connection, so a
+    /// burst printed the line once per read — burying every other line in
+    /// the log — and each of those reads held the single writer mutex for
+    /// its whole duration, which is what makes a contended database fall
+    /// over ("database is locked") rather than merely slow down. A reader
+    /// coming free is now worth waiting a few milliseconds for.
+    ///
+    /// The fallback is logged at most once per `FALLBACK_LOG_INTERVAL_MS`,
+    /// because it is a symptom of saturation, not one event per read.
     fn claimReader(self: *SqliteBackend) *SqliteBackend {
-        return self.pool.claim(self.io) catch |err| {
-            std.log.warn(
-                "sqlite: reader pool unavailable ({s}); serving this read on the write connection",
-                .{@errorName(err)},
-            );
-            return self;
+        const budget = self.pool.cfg.reader_wait_ms;
+        return self.pool.claimOrWait(self.io, budget) catch |err| blk: {
+            self.fallbacks.store(self.fallbacks.load(.monotonic) + 1, .monotonic);
+            self.logFallbackOnce(err);
+            break :blk self;
         };
+    }
+
+    /// Emit the write-connection fallback at most once per interval.
+    fn logFallbackOnce(self: *SqliteBackend, err: Error) void {
+        const now = ReaderPool.nowMs(self.io);
+        const last = self.fallback_logged_ms.load(.monotonic);
+        if (last != 0 and now >= last and now - last < FALLBACK_LOG_INTERVAL_MS) return;
+        self.fallback_logged_ms.store(now, .monotonic);
+        std.log.warn(
+            "sqlite: reader pool unavailable after waiting {d}ms ({s}); serving this read on the write connection",
+            .{ self.pool.cfg.reader_wait_ms, @errorName(err) },
+        );
+    }
+
+    /// How many reads have been served on the write connection because the
+    /// pool could not give them a reader.
+    ///
+    /// Zero is the only healthy value. This is the counter that makes the
+    /// fallback assertable: `Rows.deinit` timing, pool sizing and cap
+    /// arithmetic are all invisible from the outside, but "this read was
+    /// served by the writer" is a fact a test can read.
+    pub fn readFallbackCount(self: *const SqliteBackend) u64 {
+        return self.fallbacks.load(.monotonic);
     }
 
     /// Re-apply `cfg` to an already-open connection. Needs no allocator:
