@@ -376,3 +376,66 @@ test "pooling is really on: reads land on connections other than the writer" {
     defer id_row.deinit(alloc);
     try testing.expectEqualStrings("2", id_row.values[0]);
 }
+
+// THE SHRINK. The pool used to grow without bound: `claim` opened new
+// readers under burst load, `release` only requeued them, and `closeAll`
+// ran solely at shutdown. A burst of 75 concurrent reads left 75 readers
+// (150 fds) open for the life of the process. Idle readers past
+// `max_idle_time_ms` must be closed, down to the `read_conns` floor.
+test "pool shrinks to floor after idle timeout" {
+    const alloc = testing.allocator;
+    var p = try Pool.init(.{ .read_conns = 1, .max_idle_time_ms = 50 });
+    defer p.deinit();
+
+    // Burst: 4 concurrent claims force the pool from 1 warm reader to 4.
+    var held: [4]*SqliteBackend = undefined;
+    for (0..4) |i| held[i] = try p.db.pool.claim(testing.io);
+    try testing.expectEqual(@as(usize, 4), p.db.pool.count());
+    for (held) |slot| p.db.pool.release(testing.io, slot);
+
+    // Freshly released: nothing is old enough to reap yet.
+    p.db.pool.reapIdle(testing.io);
+    try testing.expectEqual(@as(usize, 4), p.db.pool.count());
+
+    // Past the timeout, one daemon tick reaps everything above the floor.
+    // This also exercises the swapRemove index fixup: reaping a non-last
+    // slot moves the last slot into the gap and rewrites idle entries.
+    std.Io.sleep(testing.io, .{ .nanoseconds = 150 * std.time.ns_per_ms }, .awake) catch {};
+    p.db.pool.reapIdle(testing.io);
+    try testing.expectEqual(@as(usize, 1), p.db.pool.count());
+
+    // The floor reader still serves reads.
+    const row = try p.db.queryRow(alloc, "SELECT v FROM t WHERE id = ?", &.{"1"});
+    defer row.deinit(alloc);
+    try testing.expectEqualStrings("before", row.values[0]);
+}
+
+// A CLAIMED reader is never reaped, however idle the rest of the pool is.
+// Reaping only scans the idle list; the live connection must survive and
+// stay usable, and the pool must still converge to the floor afterwards.
+test "claimed slots never reaped" {
+    const alloc = testing.allocator;
+    var p = try Pool.init(.{ .read_conns = 1, .max_idle_time_ms = 0 });
+    defer p.deinit();
+
+    const a = try p.db.pool.claim(testing.io);
+    const b = try p.db.pool.claim(testing.io);
+    const c = try p.db.pool.claim(testing.io);
+    try testing.expectEqual(@as(usize, 3), p.db.pool.count());
+
+    // `max_idle_time_ms = 0` reaps on every release pass, but only idle
+    // entries: the two released readers are closed while `a` is held.
+    p.db.pool.release(testing.io, b);
+    p.db.pool.release(testing.io, c);
+    p.db.pool.reapIdle(testing.io);
+    try testing.expectEqual(@as(usize, 1), p.db.pool.count());
+
+    // The survivor is `a`: still open, still answering reads.
+    var row = try a.queryRow(alloc, "SELECT v FROM t WHERE id = ?", &.{"1"});
+    defer row.deinit(alloc);
+    try testing.expectEqualStrings("before", row.values[0]);
+
+    p.db.pool.release(testing.io, a);
+    p.db.pool.reapIdle(testing.io);
+    try testing.expectEqual(@as(usize, 1), p.db.pool.count());
+}
