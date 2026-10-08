@@ -169,19 +169,125 @@ test "an uncapped pool still stops at the fd-derived ceiling" {
 // A read must never FAIL because the pool could not grow. When the pool
 // is out of capacity — fd quota, memory, anything — the read falls back
 // to the primary connection: slower (it serializes) but correct.
-test "a read falls back to the primary when the pool cannot grow" {
+//
+// It also must not give up INSTANTLY. A read that found the pool full used
+// to take the write connection straight away, which is the expensive
+// answer (the write connection carries one mutex and one WAL writer slot,
+// so the read serializes against every write AND holds that mutex for its
+// whole duration). So this asserts the wait happened, and that the
+// fallback is reached only once the budget is spent.
+test "a read waits for a reader, then falls back to the write connection" {
     const alloc = testing.allocator;
-    // Cap of 1, with that one reader already claimed: the next claim
-    // cannot grow the pool.
-    var p = try Pool.init(.{ .read_conns = 1, .max_read_conns = 1 });
+    // Cap of 1, with that one reader already claimed: the pool cannot
+    // grow. `reader_wait_ms` is small so the budget is observable without
+    // making the suite wait seconds.
+    var p = try Pool.init(.{ .read_conns = 1, .max_read_conns = 1, .reader_wait_ms = 25 });
     defer p.deinit();
+    const io = p.io();
 
-    const held = try p.db.pool.claim(testing.io);
-    defer p.db.pool.release(testing.io, held);
+    const held = try p.db.pool.claim(io);
+    defer p.db.pool.release(io, held);
+
+    const start = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    const row = try p.db.queryRow(alloc, "SELECT v FROM t WHERE id = ?", &.{"1"});
+    const elapsed = std.Io.Timestamp.now(io, .awake).toMilliseconds() - start;
+    defer row.deinit(alloc);
+
+    try testing.expectEqualStrings("before", row.values[0]);
+    // Exactly one fallback: this read, and nothing else.
+    try testing.expectEqual(@as(u64, 1), p.db.readFallbackCount());
+    // It waited for its budget rather than falling through. Loose bound on
+    // purpose — the clock is `std.Io`'s, and a slow machine is not a bug.
+    try testing.expect(elapsed >= 15);
+}
+
+// THE REGRESSION THAT PRODUCED THE WARNING STORM. A burst of reads against
+// a full pool used to log
+//
+//     warning: sqlite: reader pool unavailable (PoolExhausted);
+//              serving this read on the write connection
+//
+// once per read, and run every one of them on the write connection. A
+// reader that comes free a few milliseconds later is now worth waiting
+// for, so this read blocks on the pool and is served by the reader the
+// other thread hands back.
+test "a read that finds the pool full waits for a reader instead of taking the write connection" {
+    const alloc = testing.allocator;
+    var p = try Pool.init(.{ .read_conns = 1, .max_read_conns = 1, .reader_wait_ms = 5_000 });
+    defer p.deinit();
+    const io = p.io();
+
+    // The only reader is busy. That is what "the pool is full" means.
+    const held = try p.db.pool.claim(io);
+
+    const Releaser = struct {
+        db: *SqliteBackend,
+        slot: *SqliteBackend,
+
+        fn run(ctx: *@This(), thread_io: std.Io) void {
+            // Long enough that the read is certainly already blocked, so
+            // the wake-up comes from `release`'s signal and not from the
+            // reader having been idle when the read arrived.
+            std.Io.sleep(thread_io, .{ .nanoseconds = 60 * std.time.ns_per_ms }, .awake) catch return;
+            ctx.db.pool.release(thread_io, ctx.slot);
+        }
+    };
+    var ctx = Releaser{ .db = &p.db, .slot = held };
+    const releaser = try std.Thread.spawn(.{}, Releaser.run, .{ &ctx, io });
+    defer releaser.join();
 
     const row = try p.db.queryRow(alloc, "SELECT v FROM t WHERE id = ?", &.{"1"});
     defer row.deinit(alloc);
     try testing.expectEqualStrings("before", row.values[0]);
+
+    // THE ASSERTION. The value above is worthless as evidence — a read on
+    // the write connection returns the same string, which is exactly why
+    // the bug shipped. What separates the two paths is whether the pool
+    // had to hand this read to the writer.
+    try testing.expectEqual(@as(u64, 0), p.db.readFallbackCount());
+}
+
+// `read_conns` is the warm floor `init` opens eagerly; `max_read_conns` is
+// the ceiling it refuses to grow past. A cap AT OR BELOW the floor makes
+// the two contradict each other, and the damage shows up as a pool that
+// reports itself full while sitting on connections it just opened — every
+// read falling back to the writer, which is the exact symptom this file's
+// neighbours above exist to prevent.
+test "a policy cap at or below the warm floor cannot starve the pool" {
+    var p = try Pool.init(.{ .read_conns = 4, .max_read_conns = 1 });
+    defer p.deinit();
+
+    try testing.expectEqual(@as(usize, 4), p.db.pool.count());
+    try testing.expectEqual(@as(usize, 4), p.db.pool.idleCount());
+
+    // And every one of them is usable: four claims, no fallback.
+    var held: [4]*SqliteBackend = undefined;
+    for (0..4) |i| held[i] = try p.db.pool.claim(p.io());
+    for (held) |slot| p.db.pool.release(p.io(), slot);
+    try testing.expectEqual(@as(usize, 4), p.db.pool.idleCount());
+}
+
+// `release` is reached from `Rows.deinit`, which a caller can reach twice
+// (a `Rows` copied by value, a retry that deinits the error path as well).
+// Two `idle` entries for one connection means the next two `claim`s hand
+// out the SAME sqlite handle, and one read ends up stepping a statement
+// another read owns — which the reaper would then close underneath it.
+test "a repeated release cannot duplicate one connection into the idle list" {
+    var p = try Pool.init(.{ .read_conns = 1, .max_read_conns = 1 });
+    defer p.deinit();
+    const io = p.io();
+
+    const conn = try p.db.pool.claim(io);
+    p.db.pool.release(io, conn);
+    p.db.pool.release(io, conn);
+
+    try testing.expectEqual(@as(usize, 1), p.db.pool.idleCount());
+    try testing.expectEqual(@as(usize, 1), p.db.pool.count());
+
+    // The one idle entry is the connection we released — not a stranger.
+    const again = try p.db.pool.claim(io);
+    try testing.expect(again == conn);
+    p.db.pool.release(io, again);
 }
 
 // Positive control: pooling must not break the basic write→read path.
@@ -375,4 +481,67 @@ test "pooling is really on: reads land on connections other than the writer" {
     var id_row = try p.db.queryRow(alloc, "SELECT last_insert_rowid()", &.{});
     defer id_row.deinit(alloc);
     try testing.expectEqualStrings("2", id_row.values[0]);
+}
+
+// THE SHRINK. The pool used to grow without bound: `claim` opened new
+// readers under burst load, `release` only requeued them, and `closeAll`
+// ran solely at shutdown. A burst of 75 concurrent reads left 75 readers
+// (150 fds) open for the life of the process. Idle readers past
+// `max_idle_time_ms` must be closed, down to the `read_conns` floor.
+test "pool shrinks to floor after idle timeout" {
+    const alloc = testing.allocator;
+    var p = try Pool.init(.{ .read_conns = 1, .max_idle_time_ms = 50 });
+    defer p.deinit();
+
+    // Burst: 4 concurrent claims force the pool from 1 warm reader to 4.
+    var held: [4]*SqliteBackend = undefined;
+    for (0..4) |i| held[i] = try p.db.pool.claim(testing.io);
+    try testing.expectEqual(@as(usize, 4), p.db.pool.count());
+    for (held) |slot| p.db.pool.release(testing.io, slot);
+
+    // Freshly released: nothing is old enough to reap yet.
+    p.db.pool.reapIdle(testing.io);
+    try testing.expectEqual(@as(usize, 4), p.db.pool.count());
+
+    // Past the timeout, one daemon tick reaps everything above the floor.
+    // This also exercises the swapRemove index fixup: reaping a non-last
+    // slot moves the last slot into the gap and rewrites idle entries.
+    std.Io.sleep(testing.io, .{ .nanoseconds = 150 * std.time.ns_per_ms }, .awake) catch {};
+    p.db.pool.reapIdle(testing.io);
+    try testing.expectEqual(@as(usize, 1), p.db.pool.count());
+
+    // The floor reader still serves reads.
+    const row = try p.db.queryRow(alloc, "SELECT v FROM t WHERE id = ?", &.{"1"});
+    defer row.deinit(alloc);
+    try testing.expectEqualStrings("before", row.values[0]);
+}
+
+// A CLAIMED reader is never reaped, however idle the rest of the pool is.
+// Reaping only scans the idle list; the live connection must survive and
+// stay usable, and the pool must still converge to the floor afterwards.
+test "claimed slots never reaped" {
+    const alloc = testing.allocator;
+    var p = try Pool.init(.{ .read_conns = 1, .max_idle_time_ms = 0 });
+    defer p.deinit();
+
+    const a = try p.db.pool.claim(testing.io);
+    const b = try p.db.pool.claim(testing.io);
+    const c = try p.db.pool.claim(testing.io);
+    try testing.expectEqual(@as(usize, 3), p.db.pool.count());
+
+    // `max_idle_time_ms = 0` reaps on every release pass, but only idle
+    // entries: the two released readers are closed while `a` is held.
+    p.db.pool.release(testing.io, b);
+    p.db.pool.release(testing.io, c);
+    p.db.pool.reapIdle(testing.io);
+    try testing.expectEqual(@as(usize, 1), p.db.pool.count());
+
+    // The survivor is `a`: still open, still answering reads.
+    var row = try a.queryRow(alloc, "SELECT v FROM t WHERE id = ?", &.{"1"});
+    defer row.deinit(alloc);
+    try testing.expectEqualStrings("before", row.values[0]);
+
+    p.db.pool.release(testing.io, a);
+    p.db.pool.reapIdle(testing.io);
+    try testing.expectEqual(@as(usize, 1), p.db.pool.count());
 }
