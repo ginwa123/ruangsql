@@ -545,3 +545,75 @@ test "claimed slots never reaped" {
     p.db.pool.reapIdle(testing.io);
     try testing.expectEqual(@as(usize, 1), p.db.pool.count());
 }
+
+// THE LEAK CANARY. A `Rows` owns its pooled reader until `deinit`, and
+// draining it with `next()` does NOT return it. Nothing else notices when a
+// caller forgets: the row bytes belong to the caller's allocator, the reader
+// belongs to the pool, so `testing.allocator` reports a clean run while a
+// sqlite connection stays checked out for the life of the process. This is
+// the one signal that does notice.
+test "a deinited Rows returns its reader; a drained one does not" {
+    const alloc = testing.allocator;
+    var p = try Pool.init(.{ .read_conns = 1 });
+    defer p.deinit();
+
+    try testing.expectEqual(@as(usize, 0), p.db.outstandingClaims());
+
+    // Drained to completion and deinit'd: the reader comes back.
+    {
+        var rows = try p.db.query(alloc, "SELECT v FROM t WHERE id = ?", &.{"1"});
+        try testing.expectEqual(@as(usize, 1), p.db.outstandingClaims());
+        while (try rows.next()) |row| row.deinit(alloc);
+        try testing.expectEqual(@as(usize, 1), p.db.outstandingClaims());
+        rows.deinit();
+        try testing.expectEqual(@as(usize, 0), p.db.outstandingClaims());
+    }
+
+    // queryRow completes inside the call, so it never leaves one outstanding.
+    {
+        var row = try p.db.queryRow(alloc, "SELECT v FROM t WHERE id = ?", &.{"1"});
+        defer row.deinit(alloc);
+        try testing.expectEqual(@as(usize, 0), p.db.outstandingClaims());
+    }
+
+    // The bug this exists for, stated as a fact rather than as a claim: a
+    // cursor that is drained and never deinit'd holds its reader.
+    var leaked = try p.db.query(alloc, "SELECT v FROM t WHERE id = ?", &.{"1"});
+    while (try leaked.next()) |row| row.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), p.db.outstandingClaims());
+    leaked.deinit();
+    try testing.expectEqual(@as(usize, 0), p.db.outstandingClaims());
+}
+
+// A reaping pass must never orphan a slot: a slot that leaves `slots` is a
+// connection nothing can reach or ever close, and it still counts against
+// the cap. Every reader ends up back in the idle list.
+test "reaping leaves no slot unreachable" {
+    const alloc = testing.allocator;
+    var p = try Pool.init(.{ .read_conns = 2, .max_idle_time_ms = 0 });
+    defer p.deinit();
+    const io = p.io();
+
+    var held: [6]*SqliteBackend = undefined;
+    for (0..6) |i| held[i] = try p.db.pool.claim(io);
+    try testing.expectEqual(@as(usize, 6), p.db.outstandingClaims());
+    for (held) |slot| p.db.pool.release(io, slot);
+    try testing.expectEqual(@as(usize, 0), p.db.outstandingClaims());
+
+    // `max_idle_time_ms = 0` reaps on every pass, down to the warm floor.
+    for (0..4) |_| p.db.pool.reapIdle(io);
+
+    // Every slot is either idle or claimed — there is no third state. If a
+    // reaping pass dropped an entry without closing its slot, the counts
+    // would not add up and the difference would be leaked connections.
+    try testing.expectEqual(
+        p.db.pool.count(),
+        p.db.pool.idleCount() + p.db.outstandingClaims(),
+    );
+
+    // And the survivors still work.
+    var row = try p.db.queryRow(alloc, "SELECT v FROM t WHERE id = ?", &.{"1"});
+    defer row.deinit(alloc);
+    try testing.expectEqualStrings("before", row.values[0]);
+    try testing.expectEqual(@as(usize, 0), p.db.outstandingClaims());
+}

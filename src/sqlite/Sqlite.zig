@@ -571,6 +571,16 @@ pub const SqliteBackend = struct {
         /// read that must be able to give up needs a bounded wait, which is
         /// `futexWaitTimeout` over this word.
         readers_epoch: std.atomic.Value(u32) = .init(0),
+        /// Readers handed out and not yet returned.
+        ///
+        /// A `Rows` owns its reader until `deinit`, so a caller that drains a
+        /// cursor and forgets to `deinit` it does not leak MEMORY (the row
+        /// bytes belong to the caller's allocator) — it leaks a CONNECTION,
+        /// which no allocator and no leak checker can see. That is the whole
+        /// reason this counter exists: `outstandingClaims()` returning to
+        /// zero is the only thing that proves the pool gave back what it
+        /// lent, and it is assertable from a test.
+        outstanding: std.atomic.Value(usize) = .init(0),
 
         fn enable(self: *ReaderPool, io: std.Io, db_path: [:0]const u8, cfg: Config) void {
             self.db_path = alloc.dupeZ(u8, db_path) catch {
@@ -649,6 +659,7 @@ pub const SqliteBackend = struct {
             defer self.mutex.unlock(io);
             if (self.atCap()) return error.PoolExhausted;
             try self.slots.append(alloc, .{ .conn = conn, .claimed = true, .idle_since_ms = null });
+            _ = self.outstanding.fetchAdd(1, .monotonic);
             return conn;
         }
 
@@ -705,6 +716,7 @@ pub const SqliteBackend = struct {
                 if (self.slots.items[idx].claimed) continue;
                 self.slots.items[idx].claimed = true;
                 self.slots.items[idx].idle_since_ms = null;
+                _ = self.outstanding.fetchAdd(1, .monotonic);
                 return self.slots.items[idx].conn;
             }
             return null;
@@ -864,6 +876,10 @@ pub const SqliteBackend = struct {
                 // and the condition is signalled here instead, once, after
                 // the whole critical section.
                 _ = self.reapLocked(stamp);
+                // Only a genuine hand-back decrements: the early returns above
+                // all leave the connection claimed, which is what the
+                // counter is reporting.
+                _ = self.outstanding.fetchSub(1, .monotonic);
                 break :blk true;
             };
             // Announced after the entry is visible in `idle`: a woken waiter
@@ -898,25 +914,26 @@ pub const SqliteBackend = struct {
                 if (self.slots.items.len <= floor) break;
                 const idx = self.idle.items[i];
                 if (idx >= self.slots.items.len) {
-                    // Defensive: should be unreachable — every mutation of
-                    // `slots` fixes up `idle` — but a stale index must never
-                    // panic the pool. Drop it and keep going.
+                    // Unreachable: every mutation of `slots` fixes up `idle`.
+                    // Nothing is orphaned by dropping this entry, since the
+                    // slot it named is already gone.
                     _ = self.idle.swapRemove(i);
                     continue;
                 }
                 if (self.slots.items[idx].claimed) {
-                    // A duplicated `idle` entry naming a connection some
-                    // other read already owns. Drop the entry; closing it
-                    // here would pull the connection out from under that
-                    // read's live `Rows`.
-                    _ = self.idle.swapRemove(i);
+                    // In use. SKIP, never drop: the slot stays in `slots` and
+                    // an entry removed here leaves it in neither list, so no
+                    // claim can ever reach it and no reaper will ever close
+                    // it — a permanently leaked connection that also counts
+                    // against the cap. Try again next pass.
+                    i += 1;
                     continue;
                 }
                 const since = self.slots.items[idx].idle_since_ms orelse {
-                    // No age stamp means this slot was never handed back
-                    // through `release`. Treat it as claimed rather than
-                    // guess, and drop the entry.
-                    _ = self.idle.swapRemove(i);
+                    // No age stamp, so its age is unknown; reaping it blind
+                    // could close a connection someone is stepping. Skip for
+                    // the same reason as above.
+                    i += 1;
                     continue;
                 };
                 // A clock that went backwards makes the entry look fresh;
@@ -985,6 +1002,13 @@ pub const SqliteBackend = struct {
 
         pub fn count(self: *ReaderPool) usize {
             return self.slots.items.len;
+        }
+
+        /// Readers handed out and not yet returned. Zero means every claim
+        /// has been released; anything else is a caller that drained a
+        /// `Rows` and never `deinit`ed it.
+        pub fn outstandingClaims(self: *ReaderPool) usize {
+            return self.outstanding.load(.monotonic);
         }
 
         /// How many readers are sitting in the idle list right now.
@@ -1061,6 +1085,19 @@ pub const SqliteBackend = struct {
     /// served by the writer" is a fact a test can read.
     pub fn readFallbackCount(self: *const SqliteBackend) u64 {
         return self.fallbacks.load(.monotonic);
+    }
+
+    /// Pooled readers handed out and not yet returned. Zero when the pool
+    /// holds nothing.
+    ///
+    /// THE leak canary. A `Rows` owns its reader until `deinit`, so
+    /// forgetting to deinit one leaks a CONNECTION — invisible to
+    /// `testing.allocator`, because the row bytes belong to the caller and
+    /// the reader belongs to the pool. Assert this is zero after a call that
+    /// does database work and the leak fails a test instead of filling the
+    /// process's descriptors hours later.
+    pub fn outstandingClaims(self: *SqliteBackend) usize {
+        return self.pool.outstandingClaims();
     }
 
     /// Re-apply `cfg` to an already-open connection. Needs no allocator:
