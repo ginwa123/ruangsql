@@ -617,3 +617,107 @@ test "reaping leaves no slot unreachable" {
     try testing.expectEqualStrings("before", row.values[0]);
     try testing.expectEqual(@as(usize, 0), p.db.outstandingClaims());
 }
+
+/// Allocator that records whether it was asked for anything, and can be told
+/// to fail. Pass one to observe WHERE a backend allocates, which is the only
+/// way to check a knob like `Config.allocator` — reading the field back
+/// proves nothing, because a field can be honoured by nothing.
+const Spy = struct {
+    child: std.mem.Allocator,
+    allocs: usize = 0,
+    frees: usize = 0,
+
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.allocs += 1;
+        return self.child.rawAlloc(len, alignment, ra);
+    }
+    fn resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(buf, alignment, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.frees += 1;
+        self.allocs += 1;
+        return self.child.rawRemap(buf, alignment, new_len, ra);
+    }
+    fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.frees += 1;
+        self.child.rawFree(buf, alignment, ra);
+    }
+};
+
+// `Config.allocator` exists because the pool's memory was invisible to the
+// caller. This asserts the invisibility is gone: the pool's connections, its
+// index lists, and each connection's statement cache are allocated through
+// the supplied allocator rather than through `smp_allocator`.
+test "the pool allocates through the configured allocator" {
+    const alloc = testing.allocator;
+    var spy: Spy = .{ .child = alloc };
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(testing.io, &dir_buf);
+    const joined = try std.fs.path.join(alloc, &.{ dir_buf[0..dir_len], "spy.db" });
+    defer alloc.free(joined);
+    const path = try alloc.dupeZ(u8, joined);
+    defer alloc.free(path);
+
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var db: SqliteBackend = .{};
+    defer db.deinit();
+    try db.initWithConfig(io, path, .{ .read_conns = 2, .allocator = spy.allocator() });
+
+    // The warm floor alone is enough to prove the plumbing: opening two
+    // readers allocates two connections plus the pool's two index lists, and
+    // none of that may come from the global.
+    try testing.expectEqual(@as(usize, 2), db.pool.count());
+    try testing.expect(spy.allocs >= 4);
+    try testing.expectEqual(@as(usize, 0), spy.frees);
+
+    // A read caches its statement, which is the OTHER allocation a pooled
+    // connection makes and the one most likely to be missed by a partial fix.
+    // Asserted on the ALLOCATOR rather than on `stmt_cache.count()`: the read
+    // is served by a pooled reader, so its cache is the reader's, not the
+    // primary's — and "did the supplied allocator see it" is the property
+    // under test anyway, not "which connection cached it".
+    const before_read = spy.allocs;
+    var row = try db.queryRow(alloc, "SELECT 1", &.{});
+    defer row.deinit(alloc);
+    try testing.expect(spy.allocs > before_read);
+
+    // Closing returns everything it took.
+    db.deinit();
+    try testing.expectEqual(spy.allocs, spy.frees);
+}
+
+// The default must stay the global, so existing call sites keep their
+// behaviour. `null` is not an error and not a silent switch to the caller's
+// per-query allocator: that allocator is row-lifetime and the pool is not.
+test "no configured allocator still works, on the global" {
+    const alloc = testing.allocator;
+    var p = try Pool.init(.{ .read_conns = 1 });
+    defer p.deinit();
+
+    const row = try p.db.queryRow(alloc, "SELECT v FROM t WHERE id = ?", &.{"1"});
+    defer row.deinit(alloc);
+    try testing.expectEqualStrings("before", row.values[0]);
+    try testing.expectEqual(@as(usize, 0), p.db.outstandingClaims());
+}

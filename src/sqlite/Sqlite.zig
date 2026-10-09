@@ -203,6 +203,30 @@ pub const Config = struct {
     /// the database actually has are ever resident, so a generous cap is
     /// free. Set 0 to leave SQLite's own default (no mmap).
     mmap_size_bytes: u64 = 256 * 1024 * 1024,
+    /// Allocator for the reader pool's connections, its index lists, and each
+    /// connection's prepared-statement cache. null (the default) uses
+    /// `std.heap.smp_allocator`.
+    ///
+    /// WHY NOT THE ALLOCATOR PASSED TO `query` / `exec`. Those allocators are
+    /// ROW-lifetime: a server hands them a per-request arena, which is dead
+    /// the moment the handler returns. Pooled connections are not — a reader
+    /// opened by one request is reused by the next, and `Rows.deinit` returns
+    /// it long after the opening request's arena is gone. Allocating a reader
+    /// from a request arena would leave `slots` holding a pointer into freed
+    /// memory, and the next `claim` would hand that pointer to a read.
+    ///
+    /// So this is a CONSTRUCTOR-LIFETIME allocator, and that is the whole
+    /// reason it is not implicit: whatever you pass must outlive the backend.
+    ///
+    /// Set it to put the pool's memory under your own accounting. Leaving it
+    /// null keeps that memory invisible — to `testing.allocator`, to any
+    /// tracking allocator, and to any arena-based leak report. That blindness
+    /// is not theoretical: a caller that drained a `Rows` and forgot to
+    /// `deinit` it leaked a CONNECTION for the life of the process while every
+    /// allocator-based check stayed green, because the row bytes belonged to
+    /// the caller and only the connection belonged to the pool. See
+    /// `outstandingClaims`.
+    allocator: ?std.mem.Allocator = null,
 };
 
 /// What `readConfig` observed on the connection. Printed by consumers at
@@ -406,6 +430,18 @@ pub const SqliteBackend = struct {
     /// once per read.
     fallback_logged_ms: std.atomic.Value(i64) = .init(0),
 
+    /// This connection's index in its pool's `slots`, or null when it is not
+    /// pooled (the primary connection).
+    ///
+    /// Exists so `release` is O(1). It used to call `ReaderPool.indexOf`,
+    /// a linear scan of every open reader, on the completion of EVERY read —
+    /// so pool bookkeeping cost grew with the pool, measured at 514 ns per
+    /// claim+release at 8 readers and 1799 ns at 800 even after reaping was
+    /// rate-limited. Owned by the pool and guarded by the pool's mutex;
+    /// readers are exclusively owned, so no other thread can be looking at
+    /// it.
+    pool_index: ?usize = null,
+
     /// Open `db_path` with the default `Config`. Same as
     /// `initWithConfig(io, db_path, .{})`.
     pub fn init(self: *SqliteBackend, io: std.Io, db_path: [:0]const u8) Error!void {
@@ -468,6 +504,10 @@ pub const SqliteBackend = struct {
             };
         }
         slot.db = db;
+        // The statement cache outlives every caller, so it takes the
+        // connection's own allocator here rather than one from a later
+        // `query` (see `Config.allocator`).
+        slot.stmt_cache.owned_allocator = cfg.allocator;
         try slot.applyConfig(cfg);
     }
 
@@ -523,8 +563,6 @@ pub const SqliteBackend = struct {
     /// rather than held in one contiguous slice, so growing the pool never
     /// MOVES a slot that a `Rows` is holding.
     const ReaderPool = struct {
-        const alloc = std.heap.smp_allocator;
-
         /// One open reader.
         ///
         /// `claimed` is the authority on who owns the connection, and
@@ -581,9 +619,37 @@ pub const SqliteBackend = struct {
         /// zero is the only thing that proves the pool gave back what it
         /// lent, and it is assertable from a test.
         outstanding: std.atomic.Value(usize) = .init(0),
+        /// Monotonic time (ms) before which no reaping pass runs.
+        ///
+        /// WHY THIS EXISTS. `reapLocked` walks the whole idle list, because
+        /// it cannot know where the oldest entry is without looking. Called
+        /// from `release`, that made every READ pay an O(idle) scan — and
+        /// since `max_idle_time_ms` is 60 s by default, a scan during normal
+        /// operation reaps nothing and walks the entire list to discover
+        /// that. Measured, claim+release round-trip:
+        ///
+        ///     pool=  8    514 ns      pool= 200   2229 ns
+        ///     pool= 64   1133 ns      pool= 800   7311 ns
+        ///
+        /// Linear in pool size, on the read path, for zero benefit. Reaping is
+        /// a background nicety, so it is now rate-limited: a pass runs at
+        /// most once per `reapIntervalMs`, which makes the scan cost
+        /// amortised to nothing and pushes the actual reap time out to at
+        /// most `max_idle_time_ms + reapIntervalMs`.
+        ///
+        /// `reapIdle` — the explicit daemon tick — is unaffected and always
+        /// runs, so a caller that wants deterministic shrinking still has it.
+        next_reap_ms: i64 = 0,
 
         fn enable(self: *ReaderPool, io: std.Io, db_path: [:0]const u8, cfg: Config) void {
-            self.db_path = alloc.dupeZ(u8, db_path) catch {
+            // cfg FIRST: the path below is allocated with `self.alloc()`, and
+            // `closeAll` frees it the same way. Storing cfg after the dupeZ
+            // meant the copy came from the default allocator while its free
+            // came from the configured one — an allocator mismatch on a live
+            // pointer, which the supplied-allocator test caught as an
+            // "Invalid free" in the debug allocator.
+            self.cfg = cfg;
+            self.db_path = self.alloc().dupeZ(u8, db_path) catch {
                 // Without the path the pool cannot open anything, so leave
                 // it disabled: every read falls back to the primary
                 // connection, which is correct, just serialized.
@@ -592,7 +658,6 @@ pub const SqliteBackend = struct {
             };
             self.enabled = true;
             self.io = io;
-            self.cfg = cfg;
         }
 
         /// The database path this pool opens readers against.
@@ -602,6 +667,33 @@ pub const SqliteBackend = struct {
         /// shutdown-ordering bug into a panic.
         fn path(self: *ReaderPool) Error![:0]const u8 {
             return self.db_path orelse Error.DatabaseNotFound;
+        }
+
+        /// The allocator this pool allocates connections and index lists
+        /// from. Resolved per call rather than captured in a `const` because
+        /// `Config.allocator` is set at construction, and a reader is created
+        /// long afterwards.
+        fn alloc(self: *const ReaderPool) std.mem.Allocator {
+            return self.cfg.allocator orelse std.heap.smp_allocator;
+        }
+
+        /// Minimum gap between automatic reaping passes. 0 when
+        /// `max_idle_time_ms` is 0, which means "reap on every pass" — the
+        /// setting `sqlite_pool_test.zig` uses to test reaping without
+        /// sleeping.
+        fn reapIntervalMs(self: *const ReaderPool) i64 {
+            if (self.cfg.max_idle_time_ms == 0) return 0;
+            return @max(@as(i64, @intCast(self.cfg.max_idle_time_ms / 4)), 1_000);
+        }
+
+        /// Run a reaping pass if one is due, and schedule the next. Caller
+        /// holds `mutex`. Returns how many connections were closed, which is
+        /// what `release` / `claimOrWait` use to decide whether a waiter has
+        /// to be woken.
+        fn reapIfDueLocked(self: *ReaderPool, now: i64) usize {
+            if (now < self.next_reap_ms) return 0;
+            self.next_reap_ms = now + self.reapIntervalMs();
+            return self.reapLocked(now);
         }
 
         fn nowMs(io: std.Io) i64 {
@@ -620,18 +712,19 @@ pub const SqliteBackend = struct {
             var i: usize = 0;
             while (i < n) : (i += 1) {
                 if (self.atCap()) break;
-                const conn = alloc.create(SqliteBackend) catch return Error.OutOfMemory;
+                const conn = self.alloc().create(SqliteBackend) catch return Error.OutOfMemory;
                 conn.* = .{};
                 // Same reason as `openSlot`: `applyConfig` can fail after
                 // the handle is assigned, so the handle needs closing.
                 const db_path = try self.path();
                 openSingle(conn, io, db_path, self.cfg) catch |err| {
                     conn.deinit();
-                    alloc.destroy(conn);
+                    self.alloc().destroy(conn);
                     return err;
                 };
-                try self.slots.append(alloc, .{ .conn = conn, .idle_since_ms = now });
-                try self.idle.append(alloc, self.slots.items.len - 1);
+                try self.slots.append(self.alloc(), .{ .conn = conn, .idle_since_ms = now });
+                conn.pool_index = self.slots.items.len - 1;
+                try self.idle.append(self.alloc(), self.slots.items.len - 1);
             }
         }
 
@@ -643,7 +736,7 @@ pub const SqliteBackend = struct {
         /// this function used to do, and it only surfaced under fd
         /// exhaustion, because that is what makes the error paths run.
         fn openSlot(self: *ReaderPool, io: std.Io) !*SqliteBackend {
-            const conn = alloc.create(SqliteBackend) catch return Error.OutOfMemory;
+            const conn = self.alloc().create(SqliteBackend) catch return Error.OutOfMemory;
             // `pool = .{}` — a reader never nests a pool of its own.
             conn.* = .{};
             // `deinit`, not a bare `alloc.destroy`: `openSingle` can fail
@@ -651,14 +744,15 @@ pub const SqliteBackend = struct {
             // and that runs last), so the sqlite handle must be closed or
             // its fds leak for the life of the process. `deinit` is safe on
             // a half-open backend — every step null-checks first.
-            errdefer alloc.destroy(conn);
+            errdefer self.alloc().destroy(conn);
             errdefer conn.deinit();
             openSingle(conn, io, try self.path(), self.cfg) catch |err| return err;
 
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             if (self.atCap()) return error.PoolExhausted;
-            try self.slots.append(alloc, .{ .conn = conn, .claimed = true, .idle_since_ms = null });
+            try self.slots.append(self.alloc(), .{ .conn = conn, .claimed = true, .idle_since_ms = null });
+            conn.pool_index = self.slots.items.len - 1;
             _ = self.outstanding.fetchAdd(1, .monotonic);
             return conn;
         }
@@ -741,7 +835,7 @@ pub const SqliteBackend = struct {
             // never reaped — e.g. released when the pool was already at the
             // floor — still occupy slots. Reap first so a burst followed by
             // a lull does not grow the pool again before the last reap.
-            _ = self.reapLocked(nowMs(io));
+            _ = self.reapIfDueLocked(nowMs(io));
             self.mutex.unlock(io);
             return self.openSlot(io);
         }
@@ -826,7 +920,7 @@ pub const SqliteBackend = struct {
                 if (self.popIdleLocked()) |conn| return conn;
                 // Reap first: a reader that went idle long ago still holds
                 // its slot, and `atCap` counts slots, not free readers.
-                if (self.reapLocked(nowMs(io)) > 0) self.wakeReaders(io);
+                if (self.reapIfDueLocked(nowMs(io)) > 0) self.wakeReaders(io);
                 if (self.popIdleLocked()) |conn| return conn;
                 if (!self.atCap()) {
                     // Room to grow — but `openSlot` locks the mutex itself.
@@ -843,49 +937,57 @@ pub const SqliteBackend = struct {
         /// Hand a reader back. Call ONLY once its statement has been reset
         /// or finalized, so the next read starts a fresh snapshot.
         pub fn release(self: *ReaderPool, io: std.Io, slot: *SqliteBackend) void {
-            // The index lookup reads `slots.items`, so it MUST happen under
-            // the mutex: a concurrent `claim` → `openSlot` can reallocate
-            // that slice, and scanning the stale pointer is undefined.
+            // `slots.items` and `slot.pool_index` are both pool-owned, so the
+            // lookup MUST happen under the mutex: a concurrent `claim` →
+            // `openSlot` can reallocate that slice, and the reaper renumbers
+            // indices when it closes a gap.
             self.mutex.lock(io) catch return;
             const handed_back = blk: {
                 defer self.mutex.unlock(io);
-                const idx = self.indexOf(slot) orelse break :blk false;
-                if (!self.slots.items[idx].claimed) {
-                    // Already idle. A second `release` for the same
-                    // connection would put its index in `idle` a second
-                    // time, and the next `claim` would hand one connection
-                    // to two reads.
-                    break :blk false;
+                // O(1): the connection carries its own index. The bounds and
+                // identity checks cover the only way it can be stale — the
+                // reaper closed a gap and renumbered — and fall back to a
+                // scan, which is slow but cannot hand out the wrong
+                // connection.
+                var idx = slot.pool_index orelse (self.indexOf(slot) orelse break :blk false);
+                if (idx >= self.slots.items.len or self.slots.items[idx].conn != slot) {
+                    idx = self.indexOf(slot) orelse break :blk false;
                 }
-                const stamp = nowMs(io);
-                self.slots.items[idx].claimed = false;
-                self.slots.items[idx].idle_since_ms = stamp;
-                self.idle.append(alloc, idx) catch {
-                    // Out of memory for the idle index. Deliberately do NOT
-                    // `swapRemove` the slot out of `slots` here: that would
-                    // renumber every later index and silently hand the same
-                    // connection to two readers. Keeping it claimed leaks
-                    // one connection, which is the safe direction to fail.
-                    self.slots.items[idx].claimed = true;
-                    self.slots.items[idx].idle_since_ms = null;
-                    std.log.err("sqlite: reader pool lost an idle slot to OOM; leaking one connection", .{});
-                    break :blk false;
-                };
-                // Reaping can free slots a waiter is blocked on, and
-                // `reapLocked` cannot signal: it runs with the mutex held
-                // and the condition is signalled here instead, once, after
-                // the whole critical section.
-                _ = self.reapLocked(stamp);
-                // Only a genuine hand-back decrements: the early returns above
-                // all leave the connection claimed, which is what the
-                // counter is reporting.
-                _ = self.outstanding.fetchSub(1, .monotonic);
-                break :blk true;
+                break :blk self.releaseAtLocked(io, idx);
             };
             // Announced after the entry is visible in `idle`: a woken waiter
             // whose first act is to re-acquire the mutex has to find
             // something to take, or it sleeps again having lost nothing.
             if (handed_back) self.wakeReaders(io);
+        }
+
+        /// The hand-back itself, with `mutex` held. Returns whether a reader
+        /// was actually returned, which is also what the outstanding counter
+        /// keys off: every early return leaves the connection claimed.
+        fn releaseAtLocked(self: *ReaderPool, io: std.Io, idx: usize) bool {
+            if (!self.slots.items[idx].claimed) {
+                // Already idle. A second `release` for the same connection
+                // would put its index in `idle` a second time, and the next
+                // `claim` would hand one connection to two reads.
+                return false;
+            }
+            const stamp = nowMs(io);
+            self.slots.items[idx].claimed = false;
+            self.slots.items[idx].idle_since_ms = stamp;
+            self.idle.append(self.alloc(), idx) catch {
+                // Out of memory for the idle index. Deliberately do NOT
+                // `swapRemove` the slot out of `slots` here: that would
+                // renumber every later index and silently hand the same
+                // connection to two readers. Keeping it claimed leaks one
+                // connection, which is the safe direction to fail.
+                self.slots.items[idx].claimed = true;
+                self.slots.items[idx].idle_since_ms = null;
+                std.log.err("sqlite: reader pool lost an idle slot to OOM; leaking one connection", .{});
+                return false;
+            };
+            _ = self.reapIfDueLocked(stamp);
+            _ = self.outstanding.fetchSub(1, .monotonic);
+            return true;
         }
 
         /// Close idle readers older than `max_idle_time_ms`, never dropping
@@ -894,7 +996,9 @@ pub const SqliteBackend = struct {
         /// and the `claim` slow path already call it inline.
         pub fn reapIdle(self: *ReaderPool, io: std.Io) void {
             self.mutex.lock(io) catch return;
-            const reaped = self.reapLocked(nowMs(io));
+            const now = nowMs(io);
+            const reaped = self.reapLocked(now);
+            self.next_reap_ms = now + self.reapIntervalMs();
             self.mutex.unlock(io);
             // Freeing slots is exactly what a read parked on `claimOrWait`
             // is waiting for: without this it would sit out its whole
@@ -956,11 +1060,16 @@ pub const SqliteBackend = struct {
                 // connection (or two readers share one).
                 _ = self.idle.swapRemove(i);
                 const victim = self.slots.items[idx].conn;
+                victim.pool_index = null;
                 victim.deinit();
-                alloc.destroy(victim);
+                self.alloc().destroy(victim);
                 const last = self.slots.items.len - 1;
                 if (idx != last) {
                     self.slots.items[idx] = self.slots.items[last];
+                    // The moved connection's cached index must move with it,
+                    // or its next `release` would name the wrong slot. This is
+                    // the only place a slot changes index.
+                    self.slots.items[idx].conn.pool_index = idx;
                     for (self.idle.items) |*entry| {
                         if (entry.* == last) entry.* = idx;
                     }
@@ -984,13 +1093,13 @@ pub const SqliteBackend = struct {
             defer self.mutex.unlock(io);
             for (self.slots.items) |slot| {
                 slot.conn.deinit();
-                alloc.destroy(slot.conn);
+                self.alloc().destroy(slot.conn);
             }
-            self.slots.deinit(alloc);
-            self.idle.deinit(alloc);
+            self.slots.deinit(self.alloc());
+            self.idle.deinit(self.alloc());
             self.slots = .empty;
             self.idle = .empty;
-            if (self.db_path) |owned_path| alloc.free(owned_path);
+            if (self.db_path) |owned_path| self.alloc().free(owned_path);
             self.db_path = null;
             self.enabled = false;
             // Wake every waiter: a read blocked in `claimOrWait` must not
@@ -1795,8 +1904,25 @@ pub const SqliteBackend = struct {
         errdefer self.pool.release(self.io, slot);
         try slot.mutex.lock(slot.io);
         defer slot.mutex.unlock(slot.io);
-        // One-shot statement: the slot is exclusively ours, so there is
-        // nothing to gain from the cache and no one to collide with.
+        // One-shot statement. Tried the statement cache here — the slot IS
+        // exclusively ours for the life of the `Rows`, so there is no
+        // collision to avoid — and it measured SLOWER, consistently, on
+        // sparringhttp c50 over 3 reps each on identical seed data:
+        //
+        //     /db/users?limit=20   78.9k -> 75.5k rps
+        //     /db/search            56.8k -> 54.7k rps
+        //
+        // So the original reasoning stands, for a different reason than the
+        // comment claimed. Skipping `sqlite3_prepare_v2` is not free: the
+        // cached path pins a prepared statement (and its bound parameters,
+        // and a `sqlite3_reset`) to one connection for as long as that
+        // connection lives, so a burst that spreads reads over 50+ elastic
+        // readers prepares the same SQL 50 times instead of once — and with
+        // `read_conns` as a warm FLOOR and an elastic ceiling, the cache
+        // spreads cold across the whole pool while a one-shot statement is
+        // thrown away immediately. `sqlite3_prepare_v2` on a small SELECT is
+        // cheaper than a hash lookup plus a `sqlite3_reset` on a statement
+        // this connection may never see again.
         var rows = try executeQuery(slot, allocator, sql, argv);
         rows.pool = &self.pool;
         rows.slot = slot;
@@ -1923,17 +2049,25 @@ pub const SqliteBackend = struct {
     /// every existing call site) unchanged.
     const StmtCache = struct {
         map: std.StringHashMapUnmanaged(*c.sqlite3_stmt) = .empty,
+        /// Taken from `Config.allocator` at open; null falls back to
+        /// `smp_allocator` (see `allocator`).
+        owned_allocator: ?std.mem.Allocator = null,
 
-        const allocator: std.mem.Allocator = std.heap.smp_allocator;
+        /// Same allocator as the reader pool (`Config.allocator`), and for
+        /// the same reason: entries live until `SqliteBackend.deinit`, which
+        /// is far past any per-request arena a caller would hand to `query`.
+        fn allocator(self: *const StmtCache) std.mem.Allocator {
+            return self.owned_allocator orelse std.heap.smp_allocator;
+        }
 
         /// Finalize every cached statement. Called by `deinit`.
         pub fn deinit(self: *StmtCache) void {
             var it = self.map.iterator();
             while (it.next()) |entry| {
                 _ = c.sqlite3_finalize(entry.value_ptr.*);
-                allocator.free(entry.key_ptr.*);
+                self.allocator().free(entry.key_ptr.*);
             }
-            self.map.deinit(allocator);
+            self.map.deinit(self.allocator());
             self.map = .empty;
         }
 
@@ -1963,12 +2097,12 @@ pub const SqliteBackend = struct {
                 null,
             );
             if (rc != c.SQLITE_OK) return Error.PrepareFailed;
-            const key = allocator.dupe(u8, sql) catch {
+            const key = self.allocator().dupe(u8, sql) catch {
                 _ = c.sqlite3_finalize(stmt);
                 return Error.OutOfMemory;
             };
-            self.map.put(allocator, key, stmt.?) catch {
-                allocator.free(key);
+            self.map.put(self.allocator(), key, stmt.?) catch {
+                self.allocator().free(key);
                 _ = c.sqlite3_finalize(stmt);
                 return Error.OutOfMemory;
             };
