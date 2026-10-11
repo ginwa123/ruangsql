@@ -12,35 +12,16 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-// Alternative sqlite3_bind_text binding that takes the destructor parameter
-// as `isize` (a raw integer) instead of a `sqlite3_destructor_type` function
-// pointer. The cImport-generated binding uses the function-pointer type,
-// which Zig's comptime alignment check rejects when we try to pass `-1`
-// (the SQLITE_TRANSIENT sentinel) because `-1` (= 0xFFFFFFFFFFFFFFFF) is not
-// 8-byte aligned on aarch64-macos. At the C ABI level both isize and a
-// function pointer occupy one 8-byte register on x86_64/aarch64 — the
-// bits pass through unchanged. SQLite's compiled check
-// `if (xDel == SQLITE_TRANSIENT)` is a bitwise comparison and succeeds
-// regardless of whether we declared the parameter as isize or as a
-// function pointer on the Zig side.
-// Wrapper for `sqlite3_bind_text` that takes the destructor parameter as
-// `isize` (a raw integer) instead of `sqlite3_destructor_type` (a function
-// pointer). The cImport-generated binding uses the function-pointer type,
-// which Zig's comptime alignment check rejects when we try to construct
-// the SQLITE_TRANSIENT sentinel (= -1 cast to a function pointer, but
-// `0xFFFFFFFFFFFFFFFF` is not 8-byte aligned on aarch64-macos).
+// `sqlite3_bind_text` with the destructor parameter declared as `isize`
+// instead of `sqlite3_destructor_type`. The cImport-generated binding uses
+// the function-pointer type, and Zig's comptime alignment check rejects
+// passing `-1` (SQLITE_TRANSIENT) through it: `0xFFFFFFFFFFFFFFFF` is not
+// 8-byte aligned on aarch64-macos. At the C ABI level both types occupy one
+// 8-byte register, so the bits pass through unchanged and SQLite's
+// `xDel == SQLITE_TRANSIENT` bitwise comparison still succeeds.
 //
-// We side-step the alignment check by declaring this wrapper with an
-// `isize` destructor parameter. At the C ABI level both `isize` and a
-// function pointer occupy one 8-byte register on x86_64/aarch64 — the
-// bits pass through unchanged. SQLite's compiled check
-// `if (xDel == SQLITE_TRANSIENT)` is a bitwise comparison and succeeds
-// regardless of whether we declared the parameter as `isize` or as a
-// function pointer on the Zig side.
-//
-// The `@extern` builtin returns `?*const FnType` (nullable); we unwrap with
-// `orelse unreachable` because the symbol is statically linked from
-// `vendor/sqlite3/sqlite3.c` on all platforms.
+// `@extern` returns a nullable pointer; `orelse unreachable` is safe because
+// the symbol is statically linked on every platform.
 const sqlite3_bind_text_isize_Fn = fn (
     ?*anyopaque,
     c_int,
@@ -73,77 +54,30 @@ pub const Synchronous = enum(u8) {
 
 /// Connection policy applied to every `SqliteBackend` at `init`.
 ///
-/// WHY THIS EXISTS — `init` used to hard-code `journal_mode=WAL` +
-/// `busy_timeout=5000` and nothing else. WAL gives a database file
-/// exactly ONE writer slot, and a write that cannot take it blocks for
-/// `busy_timeout` and then FAILS: the write is lost, not delayed. With a
-/// 5-second ceiling and several processes sharing one file, every write on
-/// the hot path (`UPDATE sessions …`, `INSERT INTO logs …`) could come
-/// back as:
-///
-/// ```text
-/// warning: sqlite3 step failed: database is locked (sql: …)
-/// ```
-///
-/// …repeated, forever, each one a full 5-second stall.
-///
-/// Defaults, and what each buys:
-///
-///   - `busy_timeout_ms` — the ONLY defence a WAL writer has against a
-///     competing writer. Raised from 5 s to 15 s: the wait costs nothing
-///     when nobody else is writing (it only happens while the slot is
-///     genuinely taken) and converts most real contention from "write
-///     lost" into "write delayed".
-///
-///   - `synchronous` — left at `.full`, SQLite's own default, so this
-///     package does not silently change any consumer's durability. In WAL
-///     mode `.normal` is the documented recommendation (sync at
-///     checkpoints instead of on every commit); an app that prefers it
-///     opts in: `db.applyConfig(alloc, .{ .synchronous = .normal })`.
-///     Trade-off: on an OS crash / power cut the last few commits may be
-///     lost. `PRAGMA integrity_check` still passes and SQLite's WAL
-///     guarantees still hold, because recovery goes through the
-///     checkpoint.
-///
-///   - `journal_size_limit_bytes` — caps the `-wal` file. Without it the
-///     WAL is only ever APPENDED: `wal_autocheckpoint` caps how much is
-///     copied back per checkpoint, but nothing shrinks the file, so on a
-///     long-lived install it grows until a checkpoint can reset it. -1
-///     means "no limit" (SQLite's own default).
-///
-///   - `wal_autocheckpoint_pages` — SQLite's default, stated explicitly
-///     so `Config` is a complete description of the connection rather
-///     than a delta on top of whatever the library happens to do.
+/// Defaults are chosen so a caller that passes `{}` gets a connection that
+/// survives contention instead of losing writes.
 pub const Config = struct {
     busy_timeout_ms: u32 = 15_000,
     synchronous: Synchronous = .full,
     journal_size_limit_bytes: i64 = 64 * 1024 * 1024,
     wal_autocheckpoint_pages: u32 = 1_000,
-    /// Page cache for THIS connection, in KiB (`PRAGMA cache_size = -N`,
-    /// i.e. a size in KiB rather than a page count). Default 8 MiB — SQLite
-    /// ships 2 MiB, which is small for a table that is read on every
-    /// request. 0 leaves SQLite's own default in place.
-    ///
-    /// The cache is per connection, so a pool of N connections spends
-    /// N × this if you open several connections by hand.
+    /// Page cache for THIS connection, in KiB (`PRAGMA cache_size = -N`).
+    /// Default 8 MiB; SQLite ships 2 MiB. 0 leaves SQLite's own default.
+    /// The cache is per connection, so a pool of N connections spends N × this.
     cache_size_kb: u32 = 8_000,
     /// Extra READ connections `init` opens alongside the primary one.
     ///
     /// WAL gives a database file MANY concurrent readers and exactly ONE
-    /// writer. A single connection therefore serialises every read behind
-    /// one mutex — a read queued behind a write waits for the whole write,
-    /// and reads never use more than one core. Opening readers makes them
-    /// genuinely parallel; writers keep using the primary connection, which
-    /// is the only one SQLite allows to write anyway.
+    /// writer. A single connection serialises every read behind one mutex,
+    /// so reads never use more than one core. Writers keep using the
+    /// primary connection, which is the only one SQLite allows to write.
     ///
-    /// 0 = no pooling (exactly the old single-connection behaviour).
-    /// Default 7 → 8 connections total, sized to a typical 2–8 core
-    /// runtime.
+    /// 0 = no pooling (single-connection behaviour). Default 7 → 8
+    /// connections total, sized to a typical 2–8 core runtime.
     read_conns: usize = 7,
-    /// Ceiling on the reader pool. 0 = UNLIMITED (the default): a read
-    /// that finds every reader busy opens another connection rather than
-    /// queueing, so read concurrency is bounded by in-flight reads and
-    /// never by a fixed pool size.
+    /// Ceiling on the reader pool. 0 = UNLIMITED (the default): a read that
+    /// finds every reader busy opens another connection rather than
+    /// queueing, so read concurrency is bounded by in-flight reads.
     ///
     /// The pool is elastic because a reader must not be reused while a
     /// `Rows` from it is still open — see `ReaderPool.claim`. A reader is
@@ -155,27 +89,19 @@ pub const Config = struct {
     /// `cache_size_kb` of page cache and its own `mmap_size_bytes` of
     /// address space.
     ///
-    /// MUST be at least `read_conns`, and a value at or below it is
-    /// treated as `read_conns` — the warm floor is opened at `init` and a
-    /// ceiling below the floor would make the two knobs contradict each
-    /// other, leaving the pool permanently unable to hand out the readers
-    /// it just opened. See `ReaderPool.effectiveCap`.
+    /// MUST be at least `read_conns`; a value at or below it is treated as
+    /// `read_conns` — see `ReaderPool.effectiveCap`.
     max_read_conns: usize = 0,
     /// How long a read waits for a pooled reader to come free before it
     /// falls back to the primary connection. Default 5 s. 0 = never wait.
     ///
-    /// A read that finds the pool at its ceiling used to be served by the
-    /// WRITE connection immediately. That is the worst available answer:
-    /// the write connection carries one mutex and one WAL writer slot, so
-    /// the read serializes against every concurrent write, and — because a
+    /// Serving a read on the WRITE connection is the worst available
+    /// answer: it serializes against every concurrent write and — because a
     /// long read holds that mutex for its whole duration — it delays the
     /// `BEGIN IMMEDIATE` of unrelated writers, which then burn their own
-    /// `busy_timeout` and fail with "database is locked".
-    ///
-    /// So the pool waits instead: `release` signals, and the waiting read
-    /// takes the reader the moment it is handed back. Only a reader that
-    /// cannot be obtained within this budget falls back, which is the
-    /// correct last resort — correct, and rare enough to log once.
+    /// `busy_timeout` and fail with "database is locked". So the pool waits
+    /// instead: `release` signals, and the waiting read takes the reader the
+    /// moment it is handed back.
     ///
     /// Sized like `busy_timeout_ms` on purpose: that is how long SQLite
     /// itself will wait for a resource, so a read that gives up sooner than
@@ -194,9 +120,9 @@ pub const Config = struct {
     /// `PRAGMA mmap_size` in bytes: read the database through a memory
     /// mapping instead of `read()`. 0 leaves SQLite's default (no mmap).
     ///
-    /// Trades page-cache accounting for syscalls: pages still come from
-    /// the OS file cache, but each page hit skips a syscall and a copy.
-    /// It is not extra anonymous memory, so it does not count against a
+    /// Trades page-cache accounting for syscalls: pages still come from the
+    /// OS file cache, but each page hit skips a syscall and a copy. It is
+    /// not extra anonymous memory, so it does not count against a
     /// container's `memory.max` the way `cache_size` does.
     ///
     /// Default 256 MiB of window: a single mapping, only as many pages as
@@ -207,25 +133,19 @@ pub const Config = struct {
     /// connection's prepared-statement cache. null (the default) uses
     /// `std.heap.smp_allocator`.
     ///
-    /// WHY NOT THE ALLOCATOR PASSED TO `query` / `exec`. Those allocators are
-    /// ROW-lifetime: a server hands them a per-request arena, which is dead
-    /// the moment the handler returns. Pooled connections are not — a reader
-    /// opened by one request is reused by the next, and `Rows.deinit` returns
-    /// it long after the opening request's arena is gone. Allocating a reader
-    /// from a request arena would leave `slots` holding a pointer into freed
-    /// memory, and the next `claim` would hand that pointer to a read.
+    /// NOT the allocator passed to `query` / `exec`: those are ROW-lifetime
+    /// (a server hands them a per-request arena, dead the moment the handler
+    /// returns). Pooled connections are not — a reader opened by one request
+    /// is reused by the next, and `Rows.deinit` returns it long after the
+    /// opening request's arena is gone. Allocating a reader from a request
+    /// arena would leave `slots` holding a pointer into freed memory.
     ///
-    /// So this is a CONSTRUCTOR-LIFETIME allocator, and that is the whole
-    /// reason it is not implicit: whatever you pass must outlive the backend.
-    ///
-    /// Set it to put the pool's memory under your own accounting. Leaving it
-    /// null keeps that memory invisible — to `testing.allocator`, to any
-    /// tracking allocator, and to any arena-based leak report. That blindness
-    /// is not theoretical: a caller that drained a `Rows` and forgot to
-    /// `deinit` it leaked a CONNECTION for the life of the process while every
-    /// allocator-based check stayed green, because the row bytes belonged to
-    /// the caller and only the connection belonged to the pool. See
-    /// `outstandingClaims`.
+    /// So this is a CONSTRUCTOR-LIFETIME allocator: whatever you pass must
+    /// outlive the backend. Leaving it null keeps that memory invisible to
+    /// `testing.allocator` and to any arena-based leak report — a caller
+    /// that drained a `Rows` and forgot to `deinit` it leaks a CONNECTION
+    /// for the life of the process while every allocator check stays green.
+    /// See `outstandingClaims`.
     allocator: ?std.mem.Allocator = null,
 };
 
@@ -285,22 +205,17 @@ pub const Error = error{
 
 /// Cross-platform sqlite3 bindings.
 ///
-/// IMPORTANT: The `c` declarations are scoped INSIDE `SqliteBackend` (lazily
-/// resolved when the struct is referenced) — not at file level. The reason is
-/// that `@cImport(@cInclude("sqlite3.h"))` requires the sqlite3 header to be
-/// present in the compiler's include path AT THE TIME the import is resolved.
-/// On macOS, the system's `sqlite3.h` is keg-only and not in the default
-/// include path; CI installs only `openssl@3`, not `sqlite3`. Hoisting the
-/// `@cImport` to file level would force every translation unit that
-/// `@import("Sqlite.zig")`s to provide sqlite3 headers — including the test
-/// target, which has no good reason to need them at type-check time. The
-/// original (pre-windows-compatibility) code put cImport inside the struct
-/// for this reason; we preserve that pattern here.
+/// IMPORTANT: the `c` declarations are scoped INSIDE `SqliteBackend` (lazily
+/// resolved when the struct is referenced) — not at file level.
+/// `@cImport(@cInclude("sqlite3.h"))` needs the header in the include path
+/// AT THE TIME the import is resolved; on macOS the system `sqlite3.h` is
+/// keg-only and not on the default path. Hoisting it to file level would
+/// force every translation unit that `@import("Sqlite.zig")`s to provide
+/// sqlite3 headers, including the test target.
 ///
-/// On Windows (where vendored sqlite3 is compiled in from source), the
-/// `c` is a struct of manual `extern fn` declarations — also evaluated
-/// lazily because the struct field of the same name is referenced only
-/// when SqliteBackend is actually used.
+/// On Windows (where vendored sqlite3 is compiled in from source), the `c`
+/// is a struct of manual `extern fn` declarations — also evaluated lazily.
+///
 /// File descriptors one pooled reader holds, MEASURED (not guessed) by
 /// opening seven connections to one WAL database and reading the links
 /// under `/proc/self/fd`.
@@ -309,15 +224,11 @@ pub const Error = error{
 /// but the `-shm` (the WAL index) is a single shared-memory segment per
 /// PROCESS per database file, so it is paid once for the whole pool rather
 /// than per reader.
-///
-/// Over-reserving would be the safe direction to err, so note that the cap
-/// below uses this figure directly: 100 readers ≈ 200 descriptors, plus
-/// one `-shm`.
 pub const FDS_PER_READER: usize = 2;
 
 /// Descriptors reserved for everything that is NOT a pooled reader:
 /// listening sockets, one per connected SSE client, open source files,
-/// subprocess pipes. This has to be generous. A server that keeps a
+/// subprocess pipes. This has to be generous — a server that keeps a
 /// long-lived SSE stream per browser tab is already using hundreds before
 /// the database opens anything.
 pub const FD_HEADROOM: usize = 256;
@@ -327,8 +238,7 @@ pub const FD_HEADROOM: usize = 256;
 ///
 /// The fallback is a property of the POOL being saturated, not of any one
 /// read: a burst that trips it prints one line per read, which buries the
-/// rest of the log and trains everyone to ignore the one line that says
-/// something is wrong. One line per interval keeps the signal.
+/// rest of the log. One line per interval keeps the signal.
 pub const FALLBACK_LOG_INTERVAL_MS: i64 = 60_000;
 
 /// Longest single park inside `ReaderPool.waitForReaderLocked`.
@@ -387,8 +297,6 @@ pub const SqliteBackend = struct {
     ///
     /// Empty / `enabled == false` when `Config.read_conns == 0` or the
     /// path is `:memory:`, in which case every statement runs on the
-    /// backend's own connection (the historical behaviour).
-    ///
     /// WHY CLAIM/RELEASE AND NOT ROUND-ROBIN. A `Rows` from `query` keeps
     /// stepping its statement AFTER `query` returns, and an open statement
     /// keeps a READ TRANSACTION open on that connection — and SQLite allows
@@ -431,15 +339,10 @@ pub const SqliteBackend = struct {
     fallback_logged_ms: std.atomic.Value(i64) = .init(0),
 
     /// This connection's index in its pool's `slots`, or null when it is not
-    /// pooled (the primary connection).
-    ///
-    /// Exists so `release` is O(1). It used to call `ReaderPool.indexOf`,
-    /// a linear scan of every open reader, on the completion of EVERY read —
-    /// so pool bookkeeping cost grew with the pool, measured at 514 ns per
-    /// claim+release at 8 readers and 1799 ns at 800 even after reaping was
-    /// rate-limited. Owned by the pool and guarded by the pool's mutex;
-    /// readers are exclusively owned, so no other thread can be looking at
-    /// it.
+    /// pooled (the primary connection). Exists so `release` is O(1) instead
+    /// of a linear scan of every open reader on the completion of every
+    /// read. Owned by the pool and guarded by the pool's mutex; readers are
+    /// exclusively owned, so no other thread can be looking at it.
     pool_index: ?usize = null,
 
     /// Open `db_path` with the default `Config`. Same as
@@ -621,21 +524,14 @@ pub const SqliteBackend = struct {
         outstanding: std.atomic.Value(usize) = .init(0),
         /// Monotonic time (ms) before which no reaping pass runs.
         ///
-        /// WHY THIS EXISTS. `reapLocked` walks the whole idle list, because
-        /// it cannot know where the oldest entry is without looking. Called
-        /// from `release`, that made every READ pay an O(idle) scan — and
-        /// since `max_idle_time_ms` is 60 s by default, a scan during normal
-        /// operation reaps nothing and walks the entire list to discover
-        /// that. Measured, claim+release round-trip:
-        ///
-        ///     pool=  8    514 ns      pool= 200   2229 ns
-        ///     pool= 64   1133 ns      pool= 800   7311 ns
-        ///
-        /// Linear in pool size, on the read path, for zero benefit. Reaping is
-        /// a background nicety, so it is now rate-limited: a pass runs at
-        /// most once per `reapIntervalMs`, which makes the scan cost
-        /// amortised to nothing and pushes the actual reap time out to at
-        /// most `max_idle_time_ms + reapIntervalMs`.
+        /// `reapLocked` walks the whole idle list, because it cannot know
+        /// where the oldest entry is without looking. Called from `release`
+        /// on every read, that made every READ pay an O(idle) scan that
+        /// reaps nothing (the default `max_idle_time_ms` is 60 s). Reaping
+        /// is a background nicety, so it is rate-limited: a pass runs at
+        /// most once per `reapIntervalMs`, which amortises the scan to
+        /// nothing and pushes the actual reap time out to at most
+        /// `max_idle_time_ms + reapIntervalMs`.
         ///
         /// `reapIdle` — the explicit daemon tick — is unaffected and always
         /// runs, so a caller that wants deterministic shrinking still has it.
@@ -730,11 +626,9 @@ pub const SqliteBackend = struct {
 
         /// Open one more reader.
         ///
-        /// ONE cleanup path, deliberately. An `errdefer` fires on EVERY
+        /// ONE cleanup path, deliberately: an `errdefer` fires on EVERY
         /// error return, so pairing it with an explicit `alloc.destroy` on
-        /// any one of those paths is a double free — which is exactly what
-        /// this function used to do, and it only surfaced under fd
-        /// exhaustion, because that is what makes the error paths run.
+        /// any one of those paths is a double free.
         fn openSlot(self: *ReaderPool, io: std.Io) !*SqliteBackend {
             const conn = self.alloc().create(SqliteBackend) catch return Error.OutOfMemory;
             // `pool = .{}` — a reader never nests a pool of its own.
@@ -883,13 +777,11 @@ pub const SqliteBackend = struct {
         /// `claim`, but WAIT up to `budget_ms` for a reader to be released
         /// when the pool is at its ceiling instead of failing at once.
         ///
-        /// Why waiting is the right answer and the old failure was not: the
-        /// caller of a failed `claim` runs the read on the WRITE
-        /// connection, which serializes it against every concurrent write
-        /// and holds the single writer mutex for the read's whole duration
-        /// — delaying unrelated `BEGIN IMMEDIATE`s into their own
-        /// `busy_timeout`. Queueing behind another READ costs latency;
-        /// queueing behind the writer costs correctness. So: block for a
+        /// Queueing behind another READ costs latency; queueing behind the
+        /// writer costs correctness — a read served on the write connection
+        /// serializes against every concurrent write and holds the single
+        /// writer mutex for its whole duration, delaying unrelated
+        /// `BEGIN IMMEDIATE`s into their own `busy_timeout`. So: block for a
         /// reader, and only give up when the budget runs out.
         ///
         /// Returns `error.PoolExhausted` when the budget expires with no
@@ -1149,21 +1041,9 @@ pub const SqliteBackend = struct {
     /// up as `unable to open database file` on a `PRAGMA` rather than as
     /// anything that looked like a database error.
     ///
-    /// It WAITS first (`Config.reader_wait_ms`). That is the fix for the
-    /// warning this used to print once per read:
-    ///
-    ///     warning: sqlite: reader pool unavailable (PoolExhausted);
-    ///              serving this read on the write connection
-    ///
-    /// Every read that hit a full pool took the write connection, so a
-    /// burst printed the line once per read — burying every other line in
-    /// the log — and each of those reads held the single writer mutex for
-    /// its whole duration, which is what makes a contended database fall
-    /// over ("database is locked") rather than merely slow down. A reader
-    /// coming free is now worth waiting a few milliseconds for.
-    ///
-    /// The fallback is logged at most once per `FALLBACK_LOG_INTERVAL_MS`,
-    /// because it is a symptom of saturation, not one event per read.
+    /// It WAITS first (`Config.reader_wait_ms`), then falls back to the
+    /// write connection and logs at most once per `FALLBACK_LOG_INTERVAL_MS`
+    /// — the fallback is a symptom of saturation, not one event per read.
     fn claimReader(self: *SqliteBackend) *SqliteBackend {
         const budget = self.pool.cfg.reader_wait_ms;
         return self.pool.claimOrWait(self.io, budget) catch |err| blk: {
@@ -1186,12 +1066,7 @@ pub const SqliteBackend = struct {
     }
 
     /// How many reads have been served on the write connection because the
-    /// pool could not give them a reader.
-    ///
-    /// Zero is the only healthy value. This is the counter that makes the
-    /// fallback assertable: `Rows.deinit` timing, pool sizing and cap
-    /// arithmetic are all invisible from the outside, but "this read was
-    /// served by the writer" is a fact a test can read.
+    /// pool could not give them a reader. Zero is the only healthy value.
     pub fn readFallbackCount(self: *const SqliteBackend) u64 {
         return self.fallbacks.load(.monotonic);
     }
@@ -1324,12 +1199,10 @@ pub const SqliteBackend = struct {
         _ = allocator;
         const db = self.db orelse return Error.DatabaseNotFound;
 
-        // Empty SQL is a successful no-op. sqlite3_prepare_v2 with a
-        // zero-length input returns OK with stmt=NULL; calling step()
-        // on a NULL stmt is documented as harmless. Treat the whole
-        // thing as a no-op up front to avoid the NULL-stmt edge case
-        // and to make the documented behavior explicit at the wrapper
-        // level (callers don't need to special-case "" themselves).
+        // Empty SQL is a successful no-op: sqlite3_prepare_v2 on a
+        // zero-length input returns OK with stmt=NULL, and step() on a NULL
+        // stmt is documented as harmless. Short-circuit so callers do not
+        // have to special-case "" themselves.
         if (sql.len == 0) return;
 
         const prepared = self.prepareForImmediateUse(sql) catch |err| {
@@ -1368,12 +1241,10 @@ pub const SqliteBackend = struct {
 
     /// Read `stmt`'s current row into an allocator-owned `Row`, in TWO
     /// allocations: the `values` slice, and one buffer holding every
-    /// column's bytes back to back.
-    ///
-    /// The naive version allocated once per column, so a 3-column row cost
-    /// four allocator calls and the same number of frees — on a path that
-    /// runs per request and, for a list endpoint, per ROW. Callers see the
-    /// same `Row.values` shape and the same `Row.deinit` contract.
+    /// column's bytes back to back. A 3-column row therefore costs two
+    /// allocator calls instead of four, on a path that runs per request
+    /// and, for a list endpoint, per ROW. Callers see the same
+    /// `Row.values` shape and the same `Row.deinit` contract.
     ///
     /// SQL NULL still maps to an empty slice, as everywhere else here.
     fn readRowPacked(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, col_count: usize) Error!Row {
@@ -1587,10 +1458,8 @@ pub const SqliteBackend = struct {
         /// allocation, so `deinit` frees it once instead of walking the
         /// columns. null means the columns own separate allocations.
         ///
-        /// Why it exists: a 3-column row used to cost four allocator calls
-        /// (the values array plus one per column) on a path that runs once
-        /// per request. Two is the floor without hand-rolling alignment,
-        /// and it is what turns a 20-row list read from ~80 allocator calls
+        /// Two allocations is the floor without hand-rolling alignment, and
+        /// it is what turns a 20-row list read from ~80 allocator calls
         /// into ~40.
         arena: ?[]u8 = null,
 
@@ -1607,40 +1476,31 @@ pub const SqliteBackend = struct {
     };
 
     /// A database transaction. Mirrors Go's `sql.Tx` — acquire one via
-    /// `SqliteBackend.begin()` (top-level) or `SqliteBackend.savepoint(name)`
+    /// `SqliteBackend.begin()` (top-level) or `SqliteBackend.savepoint()`
     /// (nested). Run statements with the tx methods, then `commit()` to make
     /// changes permanent or `rollback()` to discard them.
     ///
-    /// **Mutex semantics:** The `SqliteBackend.mutex` is acquired and held
-    /// for the entire lifetime of the transaction. Concurrent `exec`/`query`
+    /// **Mutex semantics:** `SqliteBackend.mutex` is acquired and held for
+    /// the entire lifetime of the transaction. Concurrent `exec`/`query`
     /// calls from other threads block until `commit()`/`rollback()` releases
     /// it. DO NOT call `db.exec()` / `db.query()` from within the same thread
-    /// that holds a tx — `std.Io.Mutex` is NOT reentrant; calling a
-    /// lock-acquiring method on the backend from inside `tx.exec` will
-    /// deadlock. Use `tx.exec` / `tx.query` / `tx.queryRow` instead.
+    /// that holds a tx — `std.Io.Mutex` is NOT reentrant, so a lock-acquiring
+    /// method on the backend from inside `tx.exec` deadlocks. Use
+    /// `tx.exec` / `tx.query` / `tx.queryRow` instead.
     ///
-    /// **Single-use:** All methods (`exec`, `query`, `queryRow`, `commit`,
-    /// `rollback`) return `Error.TransactionClosed` if called after a
-    /// successful `commit()` or `rollback()`. This is a SAFETY check, not
-    /// ergonomics: after the mutex is released by commit/rollback, any
-    /// further `tx.*` call would invoke SQL on the underlying connection
-    /// WITHOUT the mutex held, racing with concurrent writers. Returning an
-    /// error prevents the UB. The recommended idiom is:
+    /// **Single-use:** every method returns `Error.TransactionClosed` if
+    /// called after a successful `commit()` / `rollback()`. This is a SAFETY
+    /// check, not ergonomics: once the mutex is released, any further `tx.*`
+    /// call would run SQL WITHOUT the mutex held, racing with concurrent
+    /// writers. The recommended idiom:
     ///
     /// ```zig
     /// var tx = try db.begin();
-    /// defer tx.rollback() catch |err| switch (err) {
-    ///     error.TransactionClosed => {}, // already committed/rolled back
-    ///     else => return err,
-    /// };
+    /// defer tx.commitOrRollback() catch {};
+    /// errdefer tx.rollback() catch {};
     /// ```
     ///
-    /// The `defer tx.rollback() catch |err| switch(err) { error.TransactionClosed => {}, ... }`
-    /// pattern mirrors Go's `defer tx.Rollback()` (which silently succeeds
-    /// on `sql.ErrTxDone`); the explicit switch is required because Zig
-    /// surfaces all errors.
-    ///
-    /// **Borrowed slices:** As with the non-tx `Row` type, slices returned
+    /// **Borrowed slices:** as with the non-tx `Row` type, slices returned
     /// from `tx.queryRow()` / `tx.query()` are allocated by the caller's
     /// allocator; the caller must call `Row.deinit(allocator)` to free them.
     pub const Transaction = struct {
@@ -1716,13 +1576,12 @@ pub const SqliteBackend = struct {
             return self._doFinalizeCommit();
         }
 
-        /// Commit the transaction if it has not yet been finalized. If the
-        /// transaction was already committed or rolled back, this is a no-op
-        /// returning success (NOT `Error.TransactionClosed` — that would defeat
-        /// the point of the defer-idiom). Mirrors Go's
+        /// Commit the transaction if it has not yet been finalized; a no-op
+        /// returning success if it already was (NOT `Error.TransactionClosed`
+        /// — that would defeat the point of the defer-idiom). Mirrors Go's
         /// `(*Tx).CommitOrRollback` (Go 1.21+).
         ///
-        /// The recommended defer-idiom for transactions (canonical pattern):
+        /// Canonical pattern:
         ///
         /// ```zig
         /// var tx = try db.begin();
@@ -1732,44 +1591,18 @@ pub const SqliteBackend = struct {
         /// try tx.commit();
         /// ```
         ///
-        /// The `defer` is a safety net (finalizes on early return), the
-        /// explicit `commit()` is the happy-path finalize. If `commit()`
-        /// already ran, the deferred `commitOrRollback()` is a silent
-        /// no-op. The `errdefer` keeps error paths atomic: Zig runs
-        /// defers LIFO, so on error `rollback()` fires first and the
-        /// deferred commit becomes a no-op. Without it, the deferred
-        /// commit would persist a partial prefix. Do NOT issue raw "BEGIN"/"COMMIT"/"ROLLBACK" via
-        /// `db.exec()` — that bypasses the mutex + depth tracking.
+        /// The `defer` is a safety net, the explicit `commit()` is the
+        /// happy-path finalize. The `errdefer` keeps error paths atomic: Zig
+        /// runs defers LIFO, so on error `rollback()` fires first and the
+        /// deferred commit becomes a no-op. Without it the deferred commit
+        /// would persist a partial prefix.
         ///
-        /// This replaces the more verbose pattern:
+        /// Do NOT issue raw "BEGIN"/"COMMIT"/"ROLLBACK" via `db.exec()` —
+        /// that bypasses the mutex + depth tracking.
         ///
-        /// ```zig
-        /// defer tx.rollback() catch |err| switch (err) {
-        ///     error.TransactionClosed => {}, // already committed
-        ///     else => return err,
-        /// };
-        /// ```
-        ///
-        /// **Why use commitOrRollback instead of `commit` in defer?**
-        /// Because if your code path called `commit()` explicitly before the
-        /// defer fired, `commitOrRollback` is a silent no-op — whereas
-        /// `tx.commit()` would return `Error.TransactionClosed` (and the catch
-        /// would log it). Both are correct; commitOrRollback is just
-        /// ergonomically cleaner for the deferred-finalize pattern.
-        ///
-        /// **Why use commitOrRollback instead of `rollback` in defer?**
-        /// Same reason: if `commit()` ran before the defer fired,
-        /// `rollback()` returns `Error.TransactionClosed`. The
-        /// `defer rollback() catch switch(TransactionClosed => {})` pattern
-        /// works but is verbose.
-        ///
-        /// **Error semantics:**
-        /// - If the COMMIT (or RELEASE for nested tx) SQL fails: returns
-        ///   `Error.ExecuteFailed`. `completed` is set so a future
-        ///   `rollback()` returns `TransactionClosed`.
-        /// - If the backend was deinitialized during the tx: returns
-        ///   `Error.DatabaseNotFound`.
-        /// - Otherwise: returns success.
+        /// Error semantics: `Error.ExecuteFailed` if the COMMIT (or RELEASE
+        /// for a nested tx) SQL fails, `Error.DatabaseNotFound` if the
+        /// backend was deinitialized during the tx, otherwise success.
         pub fn commitOrRollback(self: *Transaction) Error!void {
             if (self.completed) return; // already finalized — silent no-op
             return self._doFinalizeCommit();
@@ -1904,25 +1737,17 @@ pub const SqliteBackend = struct {
         errdefer self.pool.release(self.io, slot);
         try slot.mutex.lock(slot.io);
         defer slot.mutex.unlock(slot.io);
-        // One-shot statement. Tried the statement cache here — the slot IS
+        // One-shot statement, NOT the statement cache. The slot IS
         // exclusively ours for the life of the `Rows`, so there is no
-        // collision to avoid — and it measured SLOWER, consistently, on
-        // sparringhttp c50 over 3 reps each on identical seed data:
-        //
-        //     /db/users?limit=20   78.9k -> 75.5k rps
-        //     /db/search            56.8k -> 54.7k rps
-        //
-        // So the original reasoning stands, for a different reason than the
-        // comment claimed. Skipping `sqlite3_prepare_v2` is not free: the
-        // cached path pins a prepared statement (and its bound parameters,
-        // and a `sqlite3_reset`) to one connection for as long as that
-        // connection lives, so a burst that spreads reads over 50+ elastic
-        // readers prepares the same SQL 50 times instead of once — and with
-        // `read_conns` as a warm FLOOR and an elastic ceiling, the cache
-        // spreads cold across the whole pool while a one-shot statement is
-        // thrown away immediately. `sqlite3_prepare_v2` on a small SELECT is
-        // cheaper than a hash lookup plus a `sqlite3_reset` on a statement
-        // this connection may never see again.
+        // collision to avoid — but the cached path pins a prepared
+        // statement (plus its bound parameters and a `sqlite3_reset`) to
+        // one connection for as long as that connection lives. With
+        // `read_conns` as a warm FLOOR and an elastic ceiling, a burst that
+        // spreads reads over 50+ readers prepares the same SQL 50 times
+        // instead of once, while a one-shot statement is thrown away
+        // immediately. `sqlite3_prepare_v2` on a small SELECT is cheaper
+        // than a hash lookup plus a `sqlite3_reset` on a statement this
+        // connection may never see again.
         var rows = try executeQuery(slot, allocator, sql, argv);
         rows.pool = &self.pool;
         rows.slot = slot;
@@ -1932,16 +1757,10 @@ pub const SqliteBackend = struct {
 
     // ─── Prepared-statement cache ───────────────────────────────────────
     //
-    // `exec` and `queryRow` used to `sqlite3_prepare_v2` + `sqlite3_finalize`
-    // on EVERY call. For a server that runs the same handful of statements
-    // per request, the parse + bytecode generation + teardown costs more
-    // than executing the statement — a point read spent most of its time
-    // re-compiling itself.
-    //
-    // Both now go through `stmt_cache`, keyed by SQL text, and the savings
-    // are transparent: `exec` / `queryRow` keep their exact signatures,
-    // semantics and ownership rules, so every existing caller speeds up
-    // without changing a line.
+    // `exec` and `queryRow` go through `stmt_cache`, keyed by SQL text, so
+    // a server that runs the same handful of statements per request does
+    // not pay parse + bytecode generation + teardown on every call. Both
+    // keep their exact signatures, semantics and ownership rules.
     //
     // `query` deliberately does NOT use the cache: a `Rows` iterator keeps
     // stepping its statement AFTER `query` releases the mutex, so two live
@@ -2041,12 +1860,6 @@ pub const SqliteBackend = struct {
     ///
     /// The SQL text is duplicated as the map key, so callers may pass a
     /// temporary / stack / per-request-arena slice.
-    ///
-    /// The keys are tiny (one copy of each distinct statement a caller
-    /// uses) and there are a handful per connection, so the cache owns them
-    /// through `std.heap.smp_allocator` — a thread-safe allocator with no
-    /// deinit obligation. That keeps `init`'s signature (and therefore
-    /// every existing call site) unchanged.
     const StmtCache = struct {
         map: std.StringHashMapUnmanaged(*c.sqlite3_stmt) = .empty,
         /// Taken from `Config.allocator` at open; null falls back to
@@ -2158,14 +1971,10 @@ pub const SqliteBackend = struct {
         // reads for the caller, so it returns SQLITE_BUSY_SNAPSHOT —
         // reported as "database is locked", returned IMMEDIATELY, and the
         // busy handler is deliberately NOT consulted (there is no safe
-        // retry). Reproduced against SQLite 3.53.4:
-        //
-        //   H2 deferred-BEGIN read-then-write: database is locked (0.0000s)
-        //
-        // So every transaction that reads before it writes was a coin flip
-        // against any other process on the same file. BEGIN IMMEDIATE takes
-        // the write lock up front, where `busy_timeout` DOES apply, and the
-        // wait is honoured.
+        // retry). So every transaction that reads before it writes was a
+        // coin flip against any other process on the same file.
+        // BEGIN IMMEDIATE takes the write lock up front, where
+        // `busy_timeout` DOES apply, and the wait is honoured.
         //
         // A read-only transaction now also holds the write slot for its
         // lifetime. Call `beginDeferred()` if you genuinely need the old

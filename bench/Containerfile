@@ -1,0 +1,34 @@
+# Deterministic benchmark container for the ruangsql sqlite backend.
+#
+# The point of running the benchmark in a container is that the numbers stop
+# depending on whatever else the host happens to be doing: the CPU quota,
+# the memory ceiling and the descriptor limit are all pinned at RUN time
+# (see run-bench.sh), so two runs on different days are comparable.
+#
+# The image carries only the prebuilt benchmark binary plus the sqlite3
+# runtime it links against. Building inside the image would mean pulling a
+# full Zig toolchain over the network on every build, which is both slow and
+# a source of drift; `zig build bench` on the host is the reproducible step,
+# and this image pins the environment the binary RUNS in.
+#
+# Build:  bench/run-bench.sh     (builds the binary, then this image)
+#
+# The base is Arch Linux, matching the host distro, so the sqlite3 runtime
+# version is the same one the host probe would have linked against.
+
+FROM docker.io/library/archlinux:latest
+
+# sqlite (runtime only — the binary is already linked) plus the CA bundle
+# and shadow utilities the base image omits.
+RUN pacman -Sy --noconfirm --needed sqlite >/dev/null 2>&1 \
+    && pacman -Scc --noconfirm >/dev/null 2>&1 \
+    || true
+
+# Built by run-bench.sh before `podman build` is invoked.
+COPY zig-out/bin/bench /srv/ruangsql-bench
+
+# The benchmark writes its DB here; run-bench.sh mounts a tmpfs over it so
+# disk latency stays out of the numbers and each run starts clean.
+RUN mkdir -p /tmp/ruangsql-bench
+
+ENTRYPOINT ["/srv/ruangsql-bench"]

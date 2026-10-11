@@ -16,9 +16,9 @@
 //! pulls in the right deps for the target.
 //!
 //! Backend choice is app-controlled: the app's root build.zig passes
-//! `-Ddb_used` through as `enable-postgres`. The unchosen
-//! backend is never `@import`ed (comptime discard), so sqlite-only
-//! builds never need libpq headers/libs.
+//! `-Ddb_used` through as `enable-postgres`. The unchosen backend is
+//! never `@import`ed (comptime discard), so sqlite-only builds never
+//! need libpq headers/libs.
 
 const build_options = @import("build_options");
 

@@ -3,10 +3,8 @@
 //!
 //! Consumers (`b.dependency("databases", .{...})`) get the right sqlite3
 //! + openssl + libpq link line + include paths based on the TARGET they
-//! pass in. This means a Linux native build, a Linux → Windows cross-
-//! compile, and a macOS native build each pick up the correct deps
-//! automatically — without the consumer needing to wire per-platform
-//! system libraries themselves.
+//! pass in, so a Linux native build, a Linux → Windows cross-compile and a
+//! macOS native build each pick up the correct deps automatically.
 //!
 //! Why per-TARGET (not per-Compile from the consumer): the consumer
 //! build.zig's `linkPlatformDeps` no longer needs to know about
@@ -21,9 +19,7 @@
 //! If the host has all of them (the normal case on Arch / Debian /
 //! Fedora / Ubuntu dev hosts), the package links the system sqlite3 via
 //! `linkSystemLibrary("sqlite3")` and skips the 9 MB amalgamation
-//! compile entirely. This is what the user asked for: "before use
-//! vendor script to build, check the current system deps first, if
-//! system have the lib no need use vendor".
+//! compile entirely.
 //!
 //! Override with `-Dforce-vendor=true` to always compile the vendored
 //! amalgamation (useful for CI runners + testing the vendored path).
@@ -32,15 +28,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 /// Cross-platform "does this file exist" check used by the system-deps
-/// probe below. Earlier revisions ran `sh -c "test -f ..."` here, which
-/// is unreliable on Windows dev boxes (Git for Windows ships bash.exe at
-/// `C:\Program Files\Git\bin` but doesn't add it to PATH automatically).
-/// The probe then silently spawned-failed and fell through to the vendored
-/// path even when vcpkg had the libraries installed at
-/// `C:\vcpkg\installed\x64-windows\`. Host-OS-specific direct syscalls
-/// via `std.os`, NOT `std.c` — build.zig doesn't link libc by default
-/// (Zig 0.16 requires an explicit `link_libc = true` on the build runner
-/// module for `std.c` to resolve `fopen`).
+/// probe below. Host-OS-specific direct syscalls via `std.os`, NOT
+/// `std.c` — build.zig doesn't link libc by default (Zig 0.16 requires an
+/// explicit `link_libc = true` on the build runner module for `std.c` to
+/// resolve `fopen`).
 ///
 ///   - Linux:   `faccessat(AT_FDCWD, path, mode=0)` returns 0 when
 ///              the file exists.
@@ -60,10 +51,7 @@ fn fileExists(absolute_path: []const u8) bool {
         },
         // macOS: libc `access()` — same F_OK check as `test -f`.
         // (The build runner links libc, so the extern is always
-        // resolvable; no shell-out needed. Zig 0.16 removed
-        // std.posix.access / made it Io-based, and the old shell-out
-        // used std.heap.GeneralPurposeAllocator + a pre-0.16
-        // std.process.run signature that no longer compile.)
+        // resolvable; no shell-out needed.)
         .macos => blk: {
             const rc = std.c.access(&buf, 0); // F_OK = 0
             break :blk rc == 0;
@@ -137,15 +125,9 @@ pub fn probeSystemLibs(b: *std.Build, target: std.Build.ResolvedTarget) SystemLi
     // either the keg-only path OR the system /usr/include (rare but
     // documented for completeness).
     //
-    // Pure-Zig probe (no shell, no `bash`/`sh` dependency). Earlier
-    // revisions ran `sh -c "test -f ..."` + `ldconfig -p | grep ...`
-    // via `std.process.run`. On Windows dev boxes without `bash`/`sh`
-    // on PATH the spawn failed and the probe fell through to "vendor
-    // fallback" — which then tried to compile the 9 MB sqlite3.c
-    // amalgamation even though vcpkg already had vcpkg-installed
-    // sqlite3.lib. Same failure mode as the root build.zig + the
-    // kabelweb probe — all three get fixed by the same
-    // `fileExists(...)` helper at the top of this file.
+    // Pure-Zig probe (no shell, no `bash`/`sh` dependency): a Windows dev
+    // box without `bash` on PATH would spawn-fail and fall through to the
+    // vendored path even when vcpkg already had the libraries installed.
     var sqlite_hdr: bool = false;
     var sqlite_lib: bool = false;
     var pq_hdr: bool = false;
@@ -220,12 +202,12 @@ pub fn probeSystemLibs(b: *std.Build, target: std.Build.ResolvedTarget) SystemLi
     // `file not found` with a clear diagnostic. This avoids the
     // per-toolchain lib-name enum (MSVC `sqlite3.lib` vs MinGW
     // `libsqlite3.lib` vs `sqlite3.dll.lib`).
-//
-// On Linux / macOS we ALSO require the matching .so / .dylib to be
-// present — a header-only dev install (sqlite3-dev but no libsqlite3
-// runtime) would compile fine but fail at runtime. Cross-checking the
-// .so path is a cheap O(1) `faccessat` per probe field and saves the
-// consumer from a confusing `dyld: Library not loaded` at first use.
+    //
+    // On Linux / macOS we ALSO require the matching .so / .dylib to be
+    // present — a header-only dev install (sqlite3-dev but no libsqlite3
+    // runtime) would compile fine but fail at runtime. Cross-checking the
+    // .so path is a cheap O(1) `faccessat` per probe field and saves the
+    // consumer from a confusing `dyld: Library not loaded` at first use.
     const use_system_sqlite3 = sqlite_hdr and switch (b.graph.host.result.os.tag) {
         .windows => true,
         else => sqlite_lib,
@@ -358,16 +340,11 @@ pub fn build(b: *std.Build) void {
         // also need the brew keg-only path because the probe accepted
         // either layout.
         //
-        // Windows: do NOT add `/usr/include` — it doesn't exist on
-        // Windows (vcpkg headers live at C:/vcpkg/installed/x64-windows/
-        // include, which the Windows branch below adds separately via
-        // `addObjectFile` + the equivalent include path). The previous
-        // unconditional `addIncludePath("/usr/include")` made translate-c
-        // fail on Windows with `error: the following build command failed
-        // with exit code 5` because the path resolves to a non-existent
-        // UNC-style `\\usr\include` on Windows hosts (observed on the
-        // self-hosted runner after the databases probe started returning
-        // `use_system_sqlite3=true` against the vcpkg install).
+        // Windows: do NOT add `/usr/include` — it doesn't exist there
+        // (vcpkg headers live at C:/vcpkg/installed/x64-windows/include,
+        // added separately in the Windows branch below). The path would
+        // resolve to a non-existent UNC-style `\\usr\include` and
+        // translate-c would fail.
         if (target.result.os.tag == .macos) {
             // Brew keg-only layouts: formula `sqlite` lives at
             // opt/sqlite (NOT opt/sqlite3); keep the sqlite3 alternate
@@ -522,8 +499,7 @@ pub fn build(b: *std.Build) void {
     // `-Dtest-filter=<substr>` — Zig 0.16 moved test filtering to BUILD
     // time (`AddTestOptions.filters`); the generated test runner no longer
     // parses `--test-filter` from its own command line, so
-    // `zig build test -- --test-filter=…` aborts. Mirrors kabelweb's
-    // `zig build test -Dtest-filter=<substr>`.
+    // `zig build test -- --test-filter=…` aborts.
     const test_filter = b.option(
         []const u8,
         "test-filter",
@@ -536,4 +512,26 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run databases package tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(b.getInstallStep());
+
+    // === Benchmark ===
+    // `zig build bench` — deterministic workload over the sqlite backend,
+    // emitting one JSON object on stdout. Built in ReleaseSafe so the
+    // numbers reflect the optimized path without giving up the safety
+    // checks that would turn a silent misbind into a bogus result.
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_mod.addImport("sqlite", mod);
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = bench_mod,
+    });
+    // Install it too, so the Containerfile can COPY a single path and a
+    // human can run `zig-out/bin/bench` directly without `zig build`.
+    b.installArtifact(bench_exe);
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run the deterministic sqlite benchmark");
+    bench_step.dependOn(&run_bench.step);
 }

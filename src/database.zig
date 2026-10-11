@@ -5,18 +5,18 @@
 //!   try database.open(&db, io, .{ .sqlite_path = db_path });
 //!
 //! The concrete type behind `Db` is chosen at COMPILE time by the app's
-//! root `build.zig` (`-Ddb_used`, default `"sqlite"`). The
-//! unchosen backend is never `@import`ed, so its `@cImport` headers and
-//! link libs are never needed even though the source stays on disk:
+//! root `build.zig` (`-Ddb_used`, default `"sqlite"`). The unchosen
+//! backend is never `@import`ed, so its `@cImport` headers and link libs
+//! are never needed even though the source stays on disk:
 //!
 //!   - `-Ddb_used=sqlite` (default): `Db == SqliteBackend`, no libpq.
 //!   - `-Ddb_used=sqlite,postgres`:  `Db == PostgresBackend`, needs libpq.
 //!
 //! Both backends share the same method set (`exec` / `query` / `queryRow`
 //! / `changes` / `begin` / `savepoint` / `deinit`) and the same `Error`
-//! variants by design (see `postgres/Postgres.zig` header), so call sites
-//! stay duck-typed. Only `init` differs (file path vs conninfo) — the
-//! `open()` helper below hides that gap behind `OpenConfig`.
+//! variants by design, so call sites stay duck-typed. Only `init` differs
+//! (file path vs conninfo) — the `open()` helper below hides that gap
+//! behind `OpenConfig`.
 
 const std = @import("std");
 const build_options = @import("build_options");
