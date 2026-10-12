@@ -721,3 +721,47 @@ test "no configured allocator still works, on the global" {
     try testing.expectEqualStrings("before", row.values[0]);
     try testing.expectEqual(@as(usize, 0), p.db.outstandingClaims());
 }
+
+// The RULE behind `fdDerivedReaderCap`, asserted for budgets THIS process
+// does not have — because the one that matters is macOS's.
+//
+// macOS hands a process a soft `RLIMIT_NOFILE` of 256, which IS
+// `FD_HEADROOM`. The un-scaled rule (`(soft - FD_HEADROOM) / 2`, floored at
+// 1) therefore returned a ceiling of 1: the elastic pool could never open a
+// second reader, and every read that found the single reader busy waited out
+// the whole `reader_wait_ms` budget (5 s) before falling back to the write
+// connection. The same call gave a Linux launcher (soft 1024) 384 readers,
+// so identical code was ~4000x slower on one platform with no configuration
+// difference. No Linux CI runner can hand the test process a 256 soft limit,
+// which is exactly why the rule is a pure function of the budget.
+test "reader cap: macOS's 256-descriptor budget still funds a reader pool" {
+    // The regression, tied to the number macOS actually ships.
+    try testing.expectEqual(@as(usize, 64), sqlite.readerCapForSoftLimit(256));
+    // Not a special case for 256: no cliff anywhere below the full reserve.
+    var prev: usize = 1;
+    var soft: usize = 1;
+    while (soft <= 2 * sqlite.FD_HEADROOM) : (soft += 1) {
+        const cap = sqlite.readerCapForSoftLimit(soft);
+        try testing.expect(cap >= 1); // never zero, never an underflow
+        try testing.expect(cap >= prev); // monotone: a bigger budget never funds fewer
+        prev = cap;
+    }
+    // Any budget that can fund two readers must be allowed two.
+    try testing.expect(sqlite.readerCapForSoftLimit(8) >= 2);
+}
+
+test "reader cap: the scaled reserve never spends what the process does not have" {
+    // Below the full reserve the pool may spend at most HALF the budget —
+    // the other half is what is left for sockets, SSE clients and subprocess
+    // pipes, which is the whole reason `FD_HEADROOM` exists.
+    var soft: usize = 4;
+    while (soft <= sqlite.FD_HEADROOM) : (soft += 1) {
+        const cap = sqlite.readerCapForSoftLimit(soft);
+        try testing.expect(cap * sqlite.FDS_PER_READER <= soft - soft / 2);
+    }
+    // Above it, the reserve is affordable in full and the rule is UNCHANGED,
+    // so no process that was never constrained sees a different ceiling.
+    try testing.expectEqual(@as(usize, 128), sqlite.readerCapForSoftLimit(2 * sqlite.FD_HEADROOM));
+    try testing.expectEqual(@as(usize, 384), sqlite.readerCapForSoftLimit(1024));
+    try testing.expectEqual(@as(usize, 262_016), sqlite.readerCapForSoftLimit(524_288));
+}
