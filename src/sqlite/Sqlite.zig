@@ -231,6 +231,10 @@ pub const FDS_PER_READER: usize = 2;
 /// subprocess pipes. This has to be generous — a server that keeps a
 /// long-lived SSE stream per browser tab is already using hundreds before
 /// the database opens anything.
+///
+/// It is the reserve for a HEALTHY budget. A process whose whole budget is
+/// smaller than this cannot afford it, and `readerCapForSoftLimit` scales it
+/// down rather than spending the reserve it does not have.
 pub const FD_HEADROOM: usize = 256;
 
 /// How long a write-connection fallback stays quiet after it has been
@@ -264,9 +268,27 @@ pub fn fdDerivedReaderCap() usize {
     // `cur` is the SOFT limit — the one actually enforced, and the one a
     // `ulimit -n` in a launcher script would have lowered.
     const lim = std.posix.getrlimit(std.posix.rlimit_resource.NOFILE) catch return 32;
-    const soft = @as(usize, @intCast(lim.cur));
-    if (soft <= FD_HEADROOM) return 1;
-    const affordable = (soft - FD_HEADROOM) / FDS_PER_READER;
+    return readerCapForSoftLimit(@intCast(lim.cur));
+}
+
+/// The reader-pool ceiling for a process whose soft `RLIMIT_NOFILE` is
+/// `soft`.
+///
+/// A consumer whose process cannot supply a full `FD_HEADROOM` on top of its
+/// readers still gets a usable pool: the reserve shrinks to half the budget
+/// instead of the ceiling collapsing to one. macOS is the reason — it hands a
+/// process a soft limit of 256, which IS `FD_HEADROOM`, so the un-scaled rule
+/// returned 1 and the elastic pool could never open a second reader. Every
+/// read that found the single reader busy then waited out the whole
+/// `reader_wait_ms` budget before falling back to the write connection, i.e.
+/// the same call behaved completely differently on macOS and on Linux.
+///
+/// The `min` keeps the reserve only while it fits: for any budget at or above
+/// `2 * FD_HEADROOM` this is the original rule, so a process that was never
+/// constrained keeps the exact ceiling it had.
+pub fn readerCapForSoftLimit(soft: usize) usize {
+    const headroom = @min(FD_HEADROOM, soft / 2);
+    const affordable = (soft - headroom) / FDS_PER_READER;
     return @max(affordable, 1);
 }
 
