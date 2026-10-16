@@ -516,6 +516,81 @@ test "pool shrinks to floor after idle timeout" {
     try testing.expectEqualStrings("before", row.values[0]);
 }
 
+// THE INTERVAL. `reapIdleThrottled` is the daemon tick a long-lived server
+// calls on a cadence of its own, and the pool decides whether the work is
+// due. Without it a tick that fires more often than the age it enforces
+// just re-scans an idle list that cannot have changed.
+//
+// NOTE the setup: the burst's own `release` calls already run an inline
+// pass, which consumes the interval. So the first assertion is that a tick
+// arriving right after a burst is throttled — the pool just reaped, and
+// re-scanning immediately would be wasted work.
+test "reapIdleThrottled skips the pass when one ran inside reap_interval_ms" {
+    var p = try Pool.init(.{ .read_conns = 1, .max_idle_time_ms = 20, .reap_interval_ms = 10_000 });
+    defer p.deinit();
+
+    // Burst to 4 and release. The releases run an inline pass, which both
+    // reaps (nothing is old enough yet) and schedules the next one 10 s out.
+    var held: [4]*SqliteBackend = undefined;
+    for (0..4) |i| held[i] = try p.db.pool.claim(testing.io);
+    for (held) |slot| p.db.pool.release(testing.io, slot);
+    try testing.expectEqual(@as(usize, 4), p.db.pool.count());
+
+    // Outlive the idle age: the readers are now old enough to reap, but the
+    // last pass was moments ago and the interval is 10 s, so the tick must
+    // be a no-op. Without the throttle the pool would shrink on every tick.
+    std.Io.sleep(testing.io, .{ .nanoseconds = 60 * std.time.ns_per_ms }, .awake) catch {};
+    p.db.pool.reapIdleThrottled(testing.io);
+    try testing.expectEqual(@as(usize, 4), p.db.pool.count());
+
+    // reapIdle always runs, so the pool still converges on demand.
+    p.db.pool.reapIdle(testing.io);
+    try testing.expectEqual(@as(usize, 1), p.db.pool.count());
+}
+
+// 0 means "derive it from max_idle_time_ms", which is what every consumer
+// got before the knob existed. A consumer that never sets it must not see a
+// behaviour change: the derived interval is max(20/4, 1000) = 1 s.
+test "reap_interval_ms 0 derives the interval from max_idle_time_ms" {
+    var p = try Pool.init(.{ .read_conns = 1, .max_idle_time_ms = 20, .reap_interval_ms = 0 });
+    defer p.deinit();
+
+    var held: [4]*SqliteBackend = undefined;
+    for (0..4) |i| held[i] = try p.db.pool.claim(testing.io);
+    for (held) |slot| p.db.pool.release(testing.io, slot);
+
+    // The derived interval is 1 s and only microseconds have passed, so the
+    // tick is throttled — the inline pass on release already did the work.
+    p.db.pool.reapIdleThrottled(testing.io);
+    try testing.expectEqual(@as(usize, 4), p.db.pool.count());
+
+    // Past the idle age, reapIdle ignores the throttle and reaps.
+    std.Io.sleep(testing.io, .{ .nanoseconds = 60 * std.time.ns_per_ms }, .awake) catch {};
+    p.db.pool.reapIdle(testing.io);
+    try testing.expectEqual(@as(usize, 1), p.db.pool.count());
+}
+
+// The floor is the invariant that survives every other change: a pool may
+// shrink, but never below `read_conns`, or the next burst pays to reopen
+// connections the boot already paid for.
+test "a throttled reap still stops at the warm floor" {
+    var p = try Pool.init(.{ .read_conns = 2, .max_idle_time_ms = 20, .reap_interval_ms = 0 });
+    defer p.deinit();
+
+    var held: [6]*SqliteBackend = undefined;
+    for (0..6) |i| held[i] = try p.db.pool.claim(testing.io);
+    for (held) |slot| p.db.pool.release(testing.io, slot);
+    std.Io.sleep(testing.io, .{ .nanoseconds = 60 * std.time.ns_per_ms }, .awake) catch {};
+
+    p.db.pool.reapIdle(testing.io);
+    try testing.expectEqual(@as(usize, 2), p.db.pool.count());
+
+    // The floor readers still serve reads.
+    const row = try p.db.queryRow(testing.allocator, "SELECT v FROM t WHERE id = ?", &.{"1"});
+    defer row.deinit(testing.allocator);
+    try testing.expectEqualStrings("before", row.values[0]);
+}
+
 // A CLAIMED reader is never reaped, however idle the rest of the pool is.
 // Reaping only scans the idle list; the live connection must survive and
 // stay usable, and the pool must still converge to the floor afterwards.
