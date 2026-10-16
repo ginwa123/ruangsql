@@ -117,6 +117,22 @@ pub const Config = struct {
     /// `claim` slow path (no idle reader free), and via `reapIdle` for an
     /// optional daemon tick.
     max_idle_time_ms: u64 = 60_000,
+    /// Minimum gap between two reaping passes, in milliseconds. 0 = derive
+    /// it from `max_idle_time_ms` (a quarter of it, floored at 1 s), which
+    /// is what every consumer got before this knob existed.
+    ///
+    /// WHY A KNOB. The inline passes are traffic-driven: they run on
+    /// `release` and on the `claim` slow path, so a consumer that goes
+    /// quiet never triggers one and its pool stays fat for the life of the
+    /// process. A daemon tick is the fix, but a tick that fires more often
+    /// than the age it enforces just re-scans an idle list that cannot
+    /// have changed — so the tick needs to know the interval, and the
+    /// interval belongs next to the age it is derived from.
+    ///
+    /// `reapIdleThrottled` honours this: it skips the pass when one ran
+    /// recently, so a caller can tick blindly on any cadence. `reapIdle`
+    /// always runs, for a test that needs deterministic shrinking.
+    reap_interval_ms: u64 = 0,
     /// `PRAGMA mmap_size` in bytes: read the database through a memory
     /// mapping instead of `read()`. 0 leaves SQLite's default (no mmap).
     ///
@@ -535,6 +551,8 @@ pub const SqliteBackend = struct {
         ///
         /// `reapIdle` — the explicit daemon tick — is unaffected and always
         /// runs, so a caller that wants deterministic shrinking still has it.
+        /// `reapIdleThrottled` is the rate-limited variant for a tick that
+        /// fires on a cadence of its own.
         next_reap_ms: i64 = 0,
 
         fn enable(self: *ReaderPool, io: std.Io, db_path: [:0]const u8, cfg: Config) void {
@@ -577,8 +595,15 @@ pub const SqliteBackend = struct {
         /// `max_idle_time_ms` is 0, which means "reap on every pass" — the
         /// setting `sqlite_pool_test.zig` uses to test reaping without
         /// sleeping.
+        ///
+        /// An explicit `reap_interval_ms` wins; 0 falls back to the derived
+        /// value, so a consumer that never sets it keeps the behaviour it
+        /// had before the knob existed.
         fn reapIntervalMs(self: *const ReaderPool) i64 {
             if (self.cfg.max_idle_time_ms == 0) return 0;
+            if (self.cfg.reap_interval_ms != 0) {
+                return @intCast(self.cfg.reap_interval_ms);
+            }
             return @max(@as(i64, @intCast(self.cfg.max_idle_time_ms / 4)), 1_000);
         }
 
@@ -886,6 +911,11 @@ pub const SqliteBackend = struct {
         /// below the `read_conns` warm floor and never touching a claimed
         /// reader. Public so an optional daemon tick can call it; `release`
         /// and the `claim` slow path already call it inline.
+        ///
+        /// ALWAYS RUNS. That is the contract a test depends on: reaping
+        /// twice in a row to prove the floor holds must not silently no-op
+        /// the second time. A caller that wants the pass rate-limited
+        /// should use `reapIdleThrottled`.
         pub fn reapIdle(self: *ReaderPool, io: std.Io) void {
             self.mutex.lock(io) catch return;
             const now = nowMs(io);
@@ -895,6 +925,33 @@ pub const SqliteBackend = struct {
             // Freeing slots is exactly what a read parked on `claimOrWait`
             // is waiting for: without this it would sit out its whole
             // budget and then fall back, while the pool had room.
+            if (reaped > 0) self.wakeReaders(io);
+        }
+
+        /// `reapIdle`, but skipped when a pass ran inside
+        /// `reap_interval_ms`.
+        ///
+        /// WHY THIS EXISTS. The inline passes are traffic-driven — they run
+        /// on `release` and on the `claim` slow path — so a consumer that
+        /// goes quiet never triggers one and its pool stays fat for the
+        /// life of the process. A daemon tick is the fix, but a tick that
+        /// fires more often than the age it enforces just re-scans an idle
+        /// list that cannot have changed. This is the tick a long-lived
+        /// server should call: it can fire on any cadence and the pool
+        /// decides whether the work is due.
+        ///
+        /// `reapIdle` stays always-runs so a test keeps deterministic
+        /// shrinking; this is the production entry point.
+        pub fn reapIdleThrottled(self: *ReaderPool, io: std.Io) void {
+            self.mutex.lock(io) catch return;
+            const now = nowMs(io);
+            if (now < self.next_reap_ms) {
+                self.mutex.unlock(io);
+                return;
+            }
+            const reaped = self.reapLocked(now);
+            self.next_reap_ms = now + self.reapIntervalMs();
+            self.mutex.unlock(io);
             if (reaped > 0) self.wakeReaders(io);
         }
 
