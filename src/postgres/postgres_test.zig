@@ -1,65 +1,5 @@
-//! Comprehensive behavioral tests for `Postgres.zig` — the PostgreSQL
-//! backend that mirrors `Sqlite.zig`'s public API one-for-one. Covers:
-//!
-//!   - `init(io, conninfo)` — open connection to a libpq conninfo string
-//!   - `exec(alloc, sql, argv)` — DDL / INSERT / UPDATE / DELETE
-//!   - `queryRow(alloc, sql, argv)` — single-row read (returns first or RowNotFound)
-//!   - `query(alloc, sql, argv)` — multi-row iterator (Rows.next)
-//!   - `changes()` — row count of last write (from PQcmdTuples)
-//!   - `deinit()` — close connection
-//!
-//! Transactions:
-//!
-//!   - `begin()` → `Transaction` (top-level tx)
-//!   - `savepoint()` → `Transaction` (nested, requires an outer tx)
-//!   - `tx.exec / tx.query / tx.queryRow` — same shape as backend.*
-//!   - `tx.commit()` / `tx.rollback()` — return Error.TransactionClosed after completion
-//!   - `tx.commitOrRollback()` — silent no-op on already-finalized tx
-//!   - `tx_deinit_during_open` — use-after-free guard
-//!
-//! ## Test isolation strategy
-//!
-//! Per the project's PostgreSQL convention (`pg_tmp -t`-style), each test
-//! gets a FRESH database inside a SHARED PostgreSQL instance — same as
-//! the SQLite tests get a fresh `:memory:` DB. The flow:
-//!
-//! 1. On first call, `getOrStartTestInstance` detects a running PostgreSQL
-//!    instance at `host=/tmp port=54329 user=ginwa` (or whatever
-//!    `POSTGRES_TEST_CONNINFO` env var specifies) and returns its
-//!    conninfo string. If no instance is reachable, all tests silently
-//!    pass with no assertions (no false failures).
-//! 2. Per test, `setupDb` creates a fresh database named
-//!    `nalar_pg_test_<random>` via `CREATE DATABASE` on the shared
-//!    instance, then opens a `PostgresBackend` on that database.
-//! 3. `teardown` closes the backend, then `DROP DATABASE` cleans up.
-//!
-//! This is the strict-isolation pattern: per-test database, no shared
-//! state, no parallel-test interference. The cost is ~50 ms per test
-//! (CREATE/DROP DATABASE round-trip), which is acceptable for the test
-//! sizes we run.
-//!
-//! ## Placeholder translation
-//!
-//! Tests use SQLite-style `?` placeholders (the wrapper translates them
-//! to PostgreSQL `$N` before sending). A dedicated group
-//! `Group 10: ? → $N placeholder translation` covers the edge cases:
-//! string literals, identifiers, comments, dollar-quoted strings.
-//!
-//! ## Cross-platform
-//!
-//! The c bindings use `@cImport(@cInclude("libpq-fe.h"))` on Linux
-//! (which is the dev machine and CI host). macOS/Windows require
-//! matching manual extern declarations (already scaffolded in
-//! `Postgres.zig` — see the file-level comment for the pad).
-//!
-//! ## How tests are isolated
-//!
-//! The actual CREATE / DROP DATABASE / per-test conninfo plumbing
-//! lives in `test_helpers.zig`. This file just calls into it via
-//! thin `setupDb` / `teardown` wrappers so each test stays
-//! readable. See `test_helpers.zig` for the full API (including
-//! `createTempDb` / `dropTempDb` for any future test that wants
-//! a per-test isolated database).
+//! Behavioral tests for `Postgres.zig`: each test gets a FRESH database on a SHARED
+//! instance via `test_helpers.zig` — with no reachable instance every test silently passes.
 const std = @import("std");
 const testing = std.testing;
 const builtin = @import("builtin");
@@ -70,22 +10,17 @@ const Error = postgres_mod.Error;
 const helpers = @import("test_helpers.zig");
 
 // ─── Per-test isolation ──────────────────────────────────────────────────
-//
-// All the test-instance probing, per-test temp-DB creation, and
-// DROP-DATABASE cleanup lives in `test_helpers.zig`. The thin wrappers
-// below exist so this file can keep its terse `setupDb(env)` /
-// `teardown(ctx)` shape that mirrors sqlite_test.zig, while the real
-// implementation is shared and reusable by other test files.
+
+// Probing, temp-DB creation and DROP cleanup live in `test_helpers.zig`; these thin
+// `setupDb` / `teardown` wrappers keep this file's sqlite_test.zig-style shape.
 
 const TestEnv = helpers.TestEnv;
 const DbCtx = helpers.TestDb;
 
 fn ensureEnv(allocator: std.mem.Allocator) *const TestEnv {
     _ = helpers.getOrStartTestInstance(allocator);
-    // We always return the (possibly empty) cached env so tests can
-    // gate on `is_available`. The cache is a global singleton so the
-    // first call to `getOrStartTestInstance` does the network probe;
-    // every subsequent call is a no-op.
+    // Return the (possibly empty) cached env so tests gate on `is_available`;
+    // `getOrStartTestInstance` probes only on its first call.
     return &helpers.g_test_env;
 }
 
@@ -115,7 +50,6 @@ fn scalarText(alloc: std.mem.Allocator, db: *PostgresBackend, sql: []const u8, a
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group 1: Lifecycle
-// ═══════════════════════════════════════════════════════════════════════════
 
 test "init: connect to a fresh test database succeeds" {
     const alloc = testing.allocator;
@@ -177,10 +111,8 @@ test "deinit is idempotent (no double-free crash)" {
     ctx.db.deinit();
     // threaded still needs to be cleaned up.
     ctx.threaded.deinit();
-    // Drop the test database directly. The backend is already closed
-    // above, so dropTempDb's deinit steps must NOT run again — but the
-    // DROP itself still has to happen, otherwise this test leaks a
-    // database on the shared instance on every live-server run.
+    // The backend is already closed, so call `dropDatabase` (not `dropTempDb`) — the
+    // DROP must still run or every live-server run leaks a database on the shared instance.
     helpers.dropDatabase(alloc, env.conninfo, ctx.db_name);
     alloc.free(ctx.db_name);
 }
@@ -208,7 +140,6 @@ test "changes() called before init returns 0" {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group 2: exec
-// ═══════════════════════════════════════════════════════════════════════════
 
 test "exec CREATE TABLE works" {
     const alloc = testing.allocator;
@@ -363,21 +294,15 @@ test "exec with malformed SQL returns ExecuteFailed" {
     var ctx = try setupDb(alloc, env);
     defer teardown(alloc, &ctx);
 
-    // PostgreSQL reports PARSE ERROR at execution time (not prepare
-    // time like SQLite). Either PrepareFailed or ExecuteFailed is
-    // acceptable — both mean "the SQL couldn't run". We surface
-    // ExecuteFailed because PGexecParams is the unit of execution.
+    // PG reports PARSE ERROR at execution time, unlike SQLite at prepare time, so the
+    // wrapper surfaces ExecuteFailed (PQexecParams is the unit of execution).
     const result = ctx.db.exec(alloc, "NOT VALID SQL AT ALL garbage", &.{});
     try testing.expectError(Error.ExecuteFailed, result);
 }
 
 test "exec with too few args: PG can't infer type, returns ExecuteFailed" {
-    // PostgreSQL differs from SQLite here: with `paramTypes=NULL`, the
-    // server needs to infer the type of each parameter from the bound
-    // value. If no value is bound for a `?` placeholder, the server
-    // errors with "could not determine data type of parameter $N".
-    // This is a documented PG behavior, not a bug in the wrapper.
-    // The wrapper surfaces this as Error.ExecuteFailed.
+    // `paramTypes=NULL`, so PG infers each parameter's type from its bound value: an
+    // unbound `?` errors "could not determine data type of parameter $N" -> ExecuteFailed.
     const alloc = testing.allocator;
     const env = ensureEnv(alloc);
     if (!env.is_available) return;
@@ -474,9 +399,7 @@ test "exec with empty argv when SQL has no placeholders works" {
     var ctx = try setupDb(alloc, env);
     defer teardown(alloc, &ctx);
 
-    // Use SERIAL so the id auto-increments (no need to supply id).
-    // Adaptations from the SQLite test: SQLite INTEGER PRIMARY KEY also
-    // auto-increments, but PostgreSQL only does so with SERIAL/BIGSERIAL.
+    // PG auto-increments only via SERIAL/BIGSERIAL, not INTEGER PRIMARY KEY as in SQLite.
     try ctx.db.exec(alloc,
         "CREATE TABLE foo (id SERIAL PRIMARY KEY, name TEXT)",
         &.{});
@@ -490,14 +413,8 @@ test "exec with empty argv when SQL has no placeholders works" {
 }
 
 test "exec multi-statement SQL returns ExecuteFailed (PG rejects multi-stmt in prepared)" {
-    // PG's PQexecParams (which our wrapper uses) is implemented as a
-    // PREPARED STATEMENT, and PG rejects multi-statement input to a
-    // prepared statement with:
-    //   "cannot insert multiple commands into a prepared statement"
-    // This is DIFFERENT from SQLite's `sqlite3_prepare_v2`, which
-    // silently takes the first statement. The wrapper surfaces this
-    // as Error.ExecuteFailed (the prepare step fails before any
-    // statement is executed). This is the documented PG behavior.
+    // PQexecParams is a prepared statement, so PG rejects multi-statement input
+    // ("cannot insert multiple commands...") as ExecuteFailed; SQLite runs only the first.
     const alloc = testing.allocator;
     const env = ensureEnv(alloc);
     if (!env.is_available) return;
@@ -522,7 +439,6 @@ test "exec multi-statement SQL returns ExecuteFailed (PG rejects multi-stmt in p
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group 3: queryRow
-// ═══════════════════════════════════════════════════════════════════════════
 
 test "queryRow returns the single matching row" {
     const alloc = testing.allocator;
@@ -650,7 +566,6 @@ test "queryRow on closed/uninitialized db returns DatabaseNotFound" {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group 4: query (multi-row iterator)
-// ═══════════════════════════════════════════════════════════════════════════
 
 test "query with no rows returns iterator that yields null" {
     const alloc = testing.allocator;
@@ -844,7 +759,6 @@ test "query iterates many rows (100) without leaks" {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group 5: changes()
-// ═══════════════════════════════════════════════════════════════════════════
 
 test "changes() reflects INSERT (1)" {
     const alloc = testing.allocator;
@@ -930,7 +844,6 @@ test "changes() returns 0 for non-data-write statements (CREATE TABLE)" {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group 6: Error variant contract
-// ═══════════════════════════════════════════════════════════════════════════
 
 test "exec before init returns DatabaseNotFound" {
     var db: PostgresBackend = .{};
@@ -950,7 +863,6 @@ test "query before init returns DatabaseNotFound" {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group 7: Transaction (tx commit/rollback via API -- never raw BEGIN/COMMIT)
-// ═══════════════════════════════════════════════════════════════════════════
 
 test "tx commit commits inserts" {
     const alloc = testing.allocator;
@@ -998,7 +910,6 @@ test "tx rollback undoes inserts" {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group 8: PostgreSQL-specific features
-// ═══════════════════════════════════════════════════════════════════════════
 
 test "SERIAL PRIMARY KEY (PG-AUTOINCREMENT) produces sequential IDs" {
     const alloc = testing.allocator;
@@ -1060,9 +971,8 @@ test "schemas with search_path work transparently" {
     try ctx.db.exec(alloc, "CREATE TABLE alt.foo (id TEXT PRIMARY KEY)", &.{});
     try ctx.db.exec(alloc, "INSERT INTO alt.foo VALUES ('a')", &.{});
 
-    // Without search_path, the default 'public' schema is used so the
-    // unqualified `foo` table does NOT exist there. PG returns
-    // "relation does not exist" — we catch that and treat it as 0.
+    // No search_path, so unqualified `foo` resolves in 'public' and misses: PG's
+    // "relation does not exist" is caught and treated as 0.
     const QueryFailed = Error.QueryFailed;
     const cnt_pub_result: ?[]u8 = scalarText(alloc, &ctx.db,
         "SELECT COUNT(*) FROM foo", &.{}) catch |err| switch (err) {
@@ -1128,7 +1038,6 @@ test "JSONB column round-trips a JSON literal" {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group 9: Transaction struct (begin / tx.exec / commit / rollback)
-// ═══════════════════════════════════════════════════════════════════════════
 
 test "begin returns a Transaction and commit persists writes" {
     const alloc = testing.allocator;
@@ -1700,12 +1609,9 @@ test "integration: rollback of partial multi-statement leaves DB unchanged" {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group 10: ? → $N placeholder translation
-// ═══════════════════════════════════════════════════════════════════════════
-//
-// Six internal tests for the placeholder translator. The translator is
-// used by every exec/query/queryRow, so indirectly exercised by every
-// other test in this file. These tests cover edge cases that would
-// otherwise only show up as silent data corruption.
+
+// The translator runs in every exec/query/queryRow; these cover `?` inside string
+// literals, identifiers and comments, where a mistranslation would corrupt data.
 
 test "translatePlaceholders: simple ? → $N" {
     const alloc = testing.allocator;
@@ -1715,9 +1621,8 @@ test "translatePlaceholders: simple ? → $N" {
     var ctx = try setupDb(alloc, env);
     defer teardown(alloc, &ctx);
 
-    // Direct unit test via the public exec/query interface. The
-    // wrapper binds everything as text, so ORDER BY n uses string
-    // comparison — "1" sorts before "2" lexicographically.
+    // The wrapper binds everything as text, so ORDER BY compares lexicographically
+    // here ("1" sorts before "2").
     try ctx.db.exec(alloc,
         "CREATE TABLE foo (id TEXT PRIMARY KEY, n TEXT)",
         &.{});
