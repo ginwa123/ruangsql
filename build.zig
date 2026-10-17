@@ -383,4 +383,29 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run the deterministic sqlite benchmark");
     bench_step.dependOn(&run_bench.step);
+
+    // The comment-ceiling / catch-unreachable linter (github.com/ginwa123/zglint),
+    // pinned in build.zig.zon; `zig build zginlint:check` is the gate CI runs.
+    const zginlint_dep = b.dependency("zginlint", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zginlint_exe = zginlint_dep.artifact("zginlint");
+    const install_zginlint = b.addInstallArtifact(zginlint_exe, .{});
+    b.step("zginlint", "Build the zginlint CLI into zig-out/bin/zginlint")
+        .dependOn(&install_zginlint.step);
+
+    // The whole gate: the paths it covers, and the comment-block ceiling.
+    // 2 lines is tighter than the tool's own default of 3.
+    const zginlint_scope = [_][]const u8{ "src", "bench", "build.zig" };
+
+    // `has_side_effects` is load-bearing: a Run step is keyed by its binary and argv,
+    // NOT by the tree it reads, so without it a rerun silently skips the scan.
+    const zginlint_check = b.step("zginlint:check", "Enforce the zginlint rules on the tree (zero findings)");
+    const run_zginlint_check = b.addRunArtifact(zginlint_exe);
+    run_zginlint_check.setCwd(b.path("."));
+    run_zginlint_check.addArgs(&.{ "--max-comment-lines", "2" });
+    run_zginlint_check.addArgs(&zginlint_scope);
+    run_zginlint_check.has_side_effects = true;
+    zginlint_check.dependOn(&run_zginlint_check.step);
 }
