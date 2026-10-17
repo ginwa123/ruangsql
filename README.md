@@ -51,6 +51,39 @@ const postgres = @import("databases").postgres; // only with -Ddb_used=...,postg
   into `vendor/sqlite3/` (gitignored). Needed on macOS / Windows and for
   cross-compiles; Linux native builds use system libsqlite3 instead.
 
+## PostgreSQL backend
+
+Compiled only with `-Ddb_used=sqlite,postgres`. Same API and `Error` set as the SQLite
+backend, so `database.Db` stays swappable.
+
+- **Statements are prepared once per connection.** The first call with a given SQL text
+  `PQprepare`s it and later calls `PQexecPrepared` it, so PostgreSQL parses and plans it
+  once instead of on every call. Anything PostgreSQL refuses to prepare — a
+  multi-statement string, a parameter type it cannot infer — falls back to
+  `PQexecParams`, and the refusal is remembered per connection.
+  `STMT_CACHE_SIZE` statements are cached per connection; `preparedStatements()`
+  reports the count.
+- **Statements run on a connection pool.** `Config.conns` (default 7) connections are
+  pre-warmed at `init`; the pool grows to `Config.max_conns` (default 32, 0 =
+  unlimited) and shrinks back to the warm floor after `Config.max_idle_time_ms` idle.
+  A statement that finds every connection busy waits `Config.conn_wait_ms` and then
+  runs on the primary connection, which `readFallbackCount()` counts.
+  `Config.conns = 0` keeps every statement on one connection, like the SQLite backend
+  with `read_conns = 0`.
+- **Transactions stay on the primary connection**, held for the whole transaction, so a
+  `db.exec()` issued while one is open runs on a pooled connection — outside it.
+
+Set both backends' policies in one call:
+
+```zig
+try database.openConfigured(&db, io, .{ .postgres_conninfo = url }, .{
+    .postgres = .{ .conns = 7, .max_conns = 32 },
+});
+```
+
+`database.open` and `database.openWithConfig` are unchanged; the SQLite policy the
+latter takes is still ignored on a postgres build.
+
 ## Testing
 
 ```sh
