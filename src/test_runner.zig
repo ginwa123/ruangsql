@@ -17,5 +17,8 @@ test {
     if (build_options.enable_postgres) {
         _ = @import("postgres/postgres_test.zig");
         _ = @import("postgres/test_helpers_test.zig");
+        // `Config.conns` connection pooling, which needs a live PG server to
+        // hold several real sessions at once.
+        _ = @import("postgres/postgres_pool_test.zig");
     }
 }
