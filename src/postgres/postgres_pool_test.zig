@@ -349,6 +349,71 @@ test "conns = 0 keeps every statement on the primary connection" {
     try testing.expectEqualStrings("a", row.values[0]);
 }
 
+// PostgreSQL re-parses and re-plans every `PQexecParams` call, so a repeated statement paid for its plan each time. A connection now
+// prepares a statement on first use and re-executes it by name — per connection, so `conns = 0` is what makes the count observable.
+test "one connection prepares a repeated statement once" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const env = helpers.getOrStartTestInstance(alloc);
+    if (!env.is_available) return;
+
+    var ctx = try setupDb(alloc, io, env.conninfo, .{ .conns = 0 });
+    defer ctx.deinit(alloc, env.conninfo);
+
+    try testing.expectEqual(@as(usize, 0), ctx.db.preparedStatements());
+
+    for (0..3) |_| {
+        var row = try ctx.db.queryRow(alloc, "SELECT 1", &.{});
+        row.deinit(alloc);
+    }
+    try testing.expectEqual(@as(usize, 1), ctx.db.preparedStatements());
+
+    var second = try ctx.db.queryRow(alloc, "SELECT 2", &.{});
+    second.deinit(alloc);
+    try testing.expectEqual(@as(usize, 2), ctx.db.preparedStatements());
+
+    // A multi-statement string cannot be prepared (the wire protocol's Parse rejects it), so it runs through `PQexecParams` as
+    // before — and the refusal is REMEMBERED, so a repeated failing call does not pay a second failed `PQprepare` either.
+    try testing.expectError(postgres.Error.ExecuteFailed, ctx.db.exec(alloc, "SELECT 1; SELECT 2", &.{}));
+    try testing.expectError(postgres.Error.ExecuteFailed, ctx.db.exec(alloc, "SELECT 1; SELECT 2", &.{}));
+    try testing.expectEqual(@as(usize, 2), ctx.db.preparedStatements());
+
+    // DDL is preparable on the wire protocol, so it is cached like anything else — the statement
+    // count is the observable proof that it went through the prepared path.
+    try ctx.db.exec(alloc, "DROP TABLE IF EXISTS foo", &.{});
+    try testing.expectEqual(@as(usize, 3), ctx.db.preparedStatements());
+}
+
+// The prepared path has to bind EACH call's arguments, and with the pool two calls of the same SQL text
+// may run on two connections — each with its own prepared statement.
+test "a prepared statement binds each call's own arguments" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const env = helpers.getOrStartTestInstance(alloc);
+    if (!env.is_available) return;
+
+    var ctx = try setupDb(alloc, io, env.conninfo, .{});
+    defer ctx.deinit(alloc, env.conninfo);
+
+    try ctx.db.exec(alloc, "CREATE TABLE foo (id TEXT PRIMARY KEY)", &.{});
+    try ctx.db.exec(alloc, "INSERT INTO foo VALUES (?)", &.{"a"});
+    try ctx.db.exec(alloc, "INSERT INTO foo VALUES (?)", &.{"b"});
+
+    var count = try ctx.db.queryRow(alloc, "SELECT COUNT(*) FROM foo", &.{});
+    defer count.deinit(alloc);
+    try testing.expectEqualStrings("2", count.values[0]);
+
+    var one = try ctx.db.queryRow(alloc, "SELECT id FROM foo WHERE id = ?", &.{"b"});
+    defer one.deinit(alloc);
+    try testing.expectEqualStrings("b", one.values[0]);
+}
+
 // `testing.allocator` is the pool's OWN allocator here, so a connection, an index list or the copied
 // conninfo that `deinit` forgets fails this test: the pool holds memory the per-call allocator never sees.
 test "deinit frees the pool's own allocations" {
@@ -362,6 +427,10 @@ test "deinit frees the pool's own allocations" {
 
     var ctx = try setupDb(alloc, io, env.conninfo, .{ .conns = 4, .allocator = alloc });
     try ctx.db.exec(alloc, "CREATE TABLE foo (id TEXT PRIMARY KEY)", &.{});
+    try ctx.db.exec(alloc, "INSERT INTO foo VALUES (?)", &.{"a"});
+    // A prepared statement caches a copy of its SQL, allocated with the pool's own allocator.
+    var row = try ctx.db.queryRow(alloc, "SELECT id FROM foo WHERE id = ?", &.{"a"});
+    row.deinit(alloc);
     try testing.expectEqual(@as(usize, 4), ctx.db.pool.idleCount());
     ctx.deinit(alloc, env.conninfo);
     // Nothing to assert: the allocator is the assertion.

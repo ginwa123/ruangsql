@@ -47,6 +47,17 @@ pub const Config = struct {
     allocator: ?std.mem.Allocator = null,
 };
 
+/// How many prepared statements one connection caches. A statement is prepared on first use and
+/// re-executed with `PQexecPrepared`, so PostgreSQL stops re-parsing and re-planning it every call.
+pub const STMT_CACHE_SIZE: usize = 16;
+
+/// How many distinct SQL texts a connection remembers as UNPREPARABLE (multi-statement SQL, a
+/// parameter type PostgreSQL cannot infer), so each such call does not pay a failed `PQprepare` first.
+pub const STMT_FAIL_SIZE: usize = 8;
+
+/// Statement names are generated as `rs<N>`, so this is a whole number of digits plus the NUL.
+const STMT_NAME_LEN: usize = 8;
+
 /// Longest single park inside `ConnPool.waitForConnLocked`: a waiter wakes on this slice even when
 /// nothing signalled it, so it re-reads the clock and can still honour its budget.
 pub const MAX_WAIT_SLICE_MS: i64 = 250;
@@ -86,6 +97,22 @@ pub const PostgresBackend = struct {
             pub extern fn PQstatus(conn: ?*PGconn) c_int;
             pub extern fn PQerrorMessage(conn: ?*PGconn) [*:0]const u8;
             pub extern fn PQexec(conn: ?*PGconn, command: [*:0]const u8) ?*PGresult;
+            pub extern fn PQprepare(
+                conn: ?*PGconn,
+                stmtName: [*:0]const u8,
+                query: [*:0]const u8,
+                nParams: c_int,
+                paramTypes: ?*const c_int,
+            ) ?*PGresult;
+            pub extern fn PQexecPrepared(
+                conn: ?*PGconn,
+                stmtName: [*:0]const u8,
+                nParams: c_int,
+                paramValues: [*c]const ?[*:0]const u8,
+                paramLengths: ?*const c_int,
+                paramFormats: ?*const c_int,
+                resultFormat: c_int,
+            ) ?*PGresult;
             pub extern fn PQexecParams(
                 conn: ?*PGconn,
                 command: [*:0]const u8,
@@ -108,6 +135,17 @@ pub const PostgresBackend = struct {
             pub extern fn PQreset(conn: ?*PGconn) void;
         };
 
+    /// One prepared statement held by ONE connection: the statement name to execute, the caller's SQL
+    /// text that keys it, and its placeholder count.
+    const PreparedStmt = struct {
+        hash: u64,
+        /// Owned copy of the caller's SQL — the cache key, compared byte-for-byte on a hash hit.
+        key: []u8,
+        /// `PQprepare`'s name, NUL-terminated for libpq.
+        name: [STMT_NAME_LEN:0]u8,
+        params: usize,
+    };
+
     io: std.Io = .failing,
     /// The primary connection: `begin` / `savepoint` / every `Transaction` method run here, and it is
     /// also where a statement lands when the pool cannot supply one.
@@ -127,6 +165,17 @@ pub const PostgresBackend = struct {
     /// This connection's index in its pool's `slots`, or null when it is not pooled (the primary
     /// connection). Exists so a release is O(1) instead of a linear scan of every open connection.
     pool_index: ?usize = null,
+    /// Allocator for state that OUTLIVES one call — the prepared-statement cache — not the per-call
+    /// allocator `exec` / `query` / `queryRow` take. Set once by `openSingle`.
+    owned_alloc: std.mem.Allocator = std.heap.smp_allocator,
+    /// This connection's prepared statements, prepared on first use and re-executed by name.
+    stmt_cache: [STMT_CACHE_SIZE]?PreparedStmt = @splat(null),
+    /// How many entries of `stmt_cache` are live, and therefore the next statement name.
+    stmt_count: usize = 0,
+    /// Hashes of SQL texts PostgreSQL refused to prepare, so the failure is not retried per call.
+    stmt_failed: [STMT_FAIL_SIZE]u64 = @splat(0),
+    stmt_failed_count: usize = 0,
+
     /// Statements served on the primary connection because the pool could not supply one.
     /// Read `readFallbackCount`.
     fallbacks: std.atomic.Value(u64) = .init(0),
@@ -146,7 +195,11 @@ pub const PostgresBackend = struct {
         conninfo: [:0]const u8,
         cfg: Config,
     ) Error!void {
-        try openSingle(self, io, conninfo);
+        try openSingle(self, io, conninfo, cfg.allocator orelse std.heap.smp_allocator);
+
+        // `conns == 0` is the single-connection backend: leave the pool DISABLED, or an elastic pool with an empty floor would
+        // still open a connection on the first claim and every statement would land on a pooled one.
+        if (cfg.conns == 0) return;
 
         // Best-effort: a backend whose pool cannot open still works, one statement at a time, rather
         // than failing to start.
@@ -158,8 +211,14 @@ pub const PostgresBackend = struct {
     }
 
     /// The building block for the primary connection AND every pooled one.
-    fn openSingle(slot: *PostgresBackend, io: std.Io, conninfo: [:0]const u8) Error!void {
+    fn openSingle(
+        slot: *PostgresBackend,
+        io: std.Io,
+        conninfo: [:0]const u8,
+        owned_alloc: std.mem.Allocator,
+    ) Error!void {
         slot.io = io;
+        slot.owned_alloc = owned_alloc;
         const pgconn = c.PQconnectdb(conninfo.ptr) orelse {
             // Should never happen — PQconnectdb returns NULL only on
             // out-of-memory for the PGconn allocation itself.
@@ -177,12 +236,98 @@ pub const PostgresBackend = struct {
     pub fn deinit(self: *PostgresBackend) void {
         // Pooled connections are owned by this backend; close them with it.
         if (self.pool.enabled) self.pool.closeAll(self.io);
+        self.forgetStatements();
         if (self.conn) |conn| {
             c.PQfinish(conn);
         }
         // CRITICAL: null `conn` after finishing, or the Transaction code's `self.backend.conn == null`
         // use-after-free guard never fires (mirrors SQLite's `self.db = null`).
         self.conn = null;
+    }
+
+    /// How many statements this connection has prepared. Zero on a connection that has not run a
+    /// preparable statement yet; it never exceeds `STMT_CACHE_SIZE`.
+    pub fn preparedStatements(self: *const PostgresBackend) usize {
+        return self.stmt_count;
+    }
+
+    /// Free every cached statement name and key. The server-side statements die with the connection,
+    /// so there is nothing to `DEALLOCATE`.
+    fn forgetStatements(self: *PostgresBackend) void {
+        for (&self.stmt_cache) |*slot| {
+            if (slot.*) |st| self.owned_alloc.free(st.key);
+            slot.* = null;
+        }
+        self.stmt_count = 0;
+        self.stmt_failed_count = 0;
+    }
+
+    /// The prepared statement to run `sql` with, preparing it on first use. `null` means "run this one through `PQexecParams`": PostgreSQL
+    /// refused to prepare it, or the cache is full. A refusal is remembered, so the fallback costs one round trip per CONNECTION, not per call.
+    fn preparedFor(
+        self: *PostgresBackend,
+        conn: *c.PGconn,
+        sql: []const u8,
+        sql_z: [:0]const u8,
+        n_params: usize,
+    ) ?*PreparedStmt {
+        const h = std.hash.Wyhash.hash(0, sql);
+        for (&self.stmt_cache) |*slot| {
+            const st = slot.* orelse continue;
+            if (st.hash == h and st.params == n_params and std.mem.eql(u8, st.key, sql)) {
+                return &slot.*.?;
+            }
+        }
+        for (self.stmt_failed[0..self.stmt_failed_count]) |failed| {
+            if (failed == h) return null;
+        }
+        if (self.stmt_count >= STMT_CACHE_SIZE) return null;
+
+        var name: [STMT_NAME_LEN:0]u8 = undefined;
+        const written = std.fmt.bufPrint(name[0 .. STMT_NAME_LEN - 1], "rs{d}", .{self.stmt_count}) catch
+            return null;
+        name[written.len] = 0;
+
+        const prep = c.PQprepare(conn, &name, sql_z.ptr, @intCast(n_params), null);
+        if (prep == null) return null;
+        defer c.PQclear(prep);
+        if (c.PQresultStatus(prep) != c.PGRES_COMMAND_OK) {
+            if (self.stmt_failed_count < STMT_FAIL_SIZE) {
+                self.stmt_failed[self.stmt_failed_count] = h;
+                self.stmt_failed_count += 1;
+            }
+            return null;
+        }
+
+        const key = self.owned_alloc.dupe(u8, sql) catch return null;
+        self.stmt_cache[self.stmt_count] = .{ .hash = h, .key = key, .name = name, .params = n_params };
+        self.stmt_count += 1;
+        return &self.stmt_cache[self.stmt_count - 1].?;
+    }
+
+    /// Run one statement on `conn`: the cached prepared statement when there is one, otherwise
+    /// `PQexecParams` with the same arguments the backend has always used.
+    fn runStatement(
+        self: *PostgresBackend,
+        conn: *c.PGconn,
+        sql: []const u8,
+        sql_z: [:0]const u8,
+        values: []?[*:0]const u8,
+        n_params: usize,
+    ) ?*c.PGresult {
+        if (self.preparedFor(conn, sql, sql_z, n_params)) |st| {
+            return c.PQexecPrepared(conn, &st.name, @intCast(n_params), values.ptr, null, null, 0);
+        }
+        return c.PQexecParams(
+            conn,
+            sql_z.ptr,
+            @intCast(n_params),
+            null, // paramTypes — let server infer
+            values.ptr,
+            null, // paramLengths — ignored for text format
+            null, // paramFormats — text (0) for input
+            0, // resultFormat — text (0) for output
+        );
     }
 
     /// Translate SQLite-style `?` to PostgreSQL `$N` (1-indexed), numbering only placeholders seen in
@@ -396,16 +541,7 @@ pub const PostgresBackend = struct {
         defer allocator.free(values);
         defer for (bufs) |b| allocator.free(b);
 
-        const result = c.PQexecParams(
-            conn,
-            sql_z.ptr,
-            @intCast(argv.len),
-            null, // paramTypes — let server infer
-            values.ptr,
-            null, // paramLengths — ignored for text format
-            null, // paramFormats — text (0) for input
-            0, // resultFormat — text (0) for output
-        );
+        const result = self.runStatement(conn, sql, sql_z, values, argv.len);
         defer if (result) |r| c.PQclear(r);
 
         const status = c.PQresultStatus(result);
@@ -480,16 +616,7 @@ pub const PostgresBackend = struct {
         defer allocator.free(values);
         defer for (bufs) |b| allocator.free(b);
 
-        const result = c.PQexecParams(
-            conn,
-            sql_z.ptr,
-            @intCast(argv.len),
-            null,
-            values.ptr,
-            null,
-            null,
-            0,
-        );
+        const result = self.runStatement(conn, sql, sql_z, values, argv.len);
 
         if (result == null) {
             return Error.QueryFailed;
@@ -690,16 +817,7 @@ pub const PostgresBackend = struct {
         defer allocator.free(values);
         defer for (bufs) |b| allocator.free(b);
 
-        const result = c.PQexecParams(
-            conn,
-            sql_z.ptr,
-            @intCast(argv.len),
-            null,
-            values.ptr,
-            null,
-            null,
-            0,
-        );
+        const result = self.runStatement(conn, sql, sql_z, values, argv.len);
         // CRITICAL: no `defer c.PQclear(result)` here — `Rows` takes ownership and frees it in
         // `Rows.deinit`, so a defer would free it before `next()` reads it; error paths clear explicitly.
 
@@ -1050,7 +1168,7 @@ pub const PostgresBackend = struct {
                 const conn = self.alloc().create(PostgresBackend) catch return Error.OutOfMemory;
                 // `pool = .{}` — a pooled connection never nests a pool of its own.
                 conn.* = .{};
-                openSingle(conn, io, try self.conninfoZ()) catch |err| {
+                openSingle(conn, io, try self.conninfoZ(), self.alloc()) catch |err| {
                     conn.deinit();
                     self.alloc().destroy(conn);
                     return err;
@@ -1071,7 +1189,7 @@ pub const PostgresBackend = struct {
             // or its descriptor leaks for the life of the process. `deinit` is safe on a half-open backend: every step null-checks first.
             errdefer self.alloc().destroy(conn);
             errdefer conn.deinit();
-            try openSingle(conn, io, try self.conninfoZ());
+            try openSingle(conn, io, try self.conninfoZ(), self.alloc());
 
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
