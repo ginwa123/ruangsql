@@ -1,79 +1,5 @@
-//! Comprehensive behavioral tests for `Sqlite.zig` — the cross-platform
-//! sqlite3 wrapper used by nalar everywhere. Covers the public API:
-//!
-//!   - `init(io, db_path)` — open DB, enable WAL + busy_timeout
-//!   - `exec(alloc, sql, argv)` — INSERT / UPDATE / DELETE / CREATE
-//!   - `queryRow(alloc, sql, argv)` — single-row read (returns first)
-//!   - `query(alloc, sql, argv)` — multi-row iterator (Rows.next)
-//!   - `changes()` — row count of last write
-//!   - `deinit()` — close DB
-//!
-//! Transactions:
-//!
-//!   - `begin()` → `Transaction` (top-level tx)
-//!   - `savepoint()` → `Transaction` (nested, requires an outer tx)
-//!   - `tx.exec / tx.query / tx.queryRow` — same shape as backend.*
-//!   - `tx.commit()` / `tx.rollback()` — return Error.TransactionClosed after completion
-//!
-//!   The backend mutex is held for the entire tx lifetime, so concurrent
-//!   `exec`/`query` calls from other threads block until `commit()` or
-//!   `rollback()` releases it. Do NOT call `db.exec` / `db.query` from
-//!   within the same thread that holds a tx — `std.Io.Mutex` is not
-//!   reentrant. Use the `tx.*` variants instead.
-//!
-//! Usage example — canonical pattern (defer as safety net + explicit commit):
-//!
-//! ```zig
-//! var tx = try db.begin();
-//! defer tx.commitOrRollback() catch {};
-//! errdefer tx.rollback() catch {}; // atomic: error paths roll back
-//! try tx.exec(alloc, "INSERT INTO foo VALUES ('a')", &.{});
-//! try tx.exec(alloc, "UPDATE foo SET x = ? WHERE id = ?", &.{"1", "a"});
-//! try tx.commit();
-//! ```
-//!
-//! Do NOT issue raw "BEGIN" / "COMMIT" / "ROLLBACK" via `db.exec()` —
-//! that bypasses the backend mutex + transaction_depth tracking. Always
-//! go through `db.begin()` / `tx.exec()` / `tx.commit()` as above.
-//!
-//! Older style (commit at the bottom with verbose rollback defer):
-//! var tx = try db.begin();
-//! defer tx.rollback() catch |err| switch (err) {
-//!     error.TransactionClosed => {},   // already committed — safe no-op
-//!     else => return err,
-//! };
-//! try tx.exec(alloc, "INSERT INTO foo VALUES ('a')", &.{});
-//! try tx.exec(alloc, "UPDATE foo SET x = ? WHERE id = ?", &.{"1", "a"});
-//! try tx.commit();  // Easy to forget when an early return is added later
-//! ```
-//!
-//! Why the defer-commitOrRollback pattern is preferred:
-//!   - One line instead of a 5-line switch.
-//!   - Robust to early `return` or `try` errors — defer always fires.
-//!   - The tx finalizes at exactly one predictable point (function exit),
-//!     regardless of which statement caused the early return.
-//!   - If the COMMIT SQL itself fails (rare: disk full, constraint
-//!     violation at commit time), `commitOrRollback` returns
-//!     `Error.ExecuteFailed` so the caller can handle it explicitly.
-//!   - The "commit in defer" shape makes the lifetime of the tx
-//!     visually obvious from the function body — readers don't need
-//!     to trace control flow to find the finalization point.
-//!
-//! Tests follow the in-memory `:memory:` + `std.Io.Threaded` pattern from
-//! `routines/model_test.zig`. Each test gets a fresh DB via `setupDb()`.
-//!
-//! Edge cases probed (see individual `test "..."` blocks):
-//!   - empty SQL / malformed SQL / mismatched bind arity
-//!   - UTF-8 text + binary bytes + SQL-injection-style quotes
-//!   - NULL handling (empty `[]u8` for column, NULL binding for `""` arg)
-//!   - constraint violations (NOT NULL, UNIQUE)
-//!   - Row.deinit leak detection (single allocation check)
-//!   - `changes()` accounting across INSERT/UPDATE/DELETE
-//!   - error variant contract for `init` failures (DatabaseNotFound,
-//!     PermissionDenied) — file-system level
-//!   - tx commit / rollback / defer-rollback TransactionClosed enforcement
-//!   - nested savepoints (depth 2 / 3)
-//!   - backend.deinit() during open tx (use-after-free guard)
+//! Behavioral tests for `Sqlite.zig`: in-memory `:memory:` DB per test via `setupDb()`; covers init/exec/query/queryRow/changes/deinit, tx + savepoints, error variants.
+//! A tx holds the backend mutex for its whole lifetime — never call `db.exec`/`db.query` inside one (`std.Io.Mutex` is not reentrant), and never issue raw BEGIN/COMMIT: use `db.begin()` / `tx.*`.
 
 const std = @import("std");
 const testing = std.testing;
@@ -84,17 +10,15 @@ const SqliteBackend = sqlite_mod.SqliteBackend;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────
 
-/// Context returned by `setupDb` — held by name so callers can
-/// reference it consistently (avoids the "anonymous struct in two
-/// scopes are distinct types" Zig 0.16 pitfall).
+/// Context returned by `setupDb`, as a named type so every scope sees the same
+/// type — two anonymous structs would be distinct types in Zig 0.16.
 const DbCtx = struct {
     db: SqliteBackend,
     threaded: std.Io.Threaded,
 };
 
-/// Open a fresh in-memory sqlite DB and return it alongside the Io
-/// runtime that owns its event loop. Caller MUST call `teardown()` on
-/// the returned value (or use the `defer teardown(...)` pattern).
+/// Open a fresh in-memory sqlite DB plus the Io runtime that owns its event
+/// loop; the caller MUST `teardown()` the returned value.
 fn setupDb() !DbCtx {
     const alloc = testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
@@ -126,9 +50,8 @@ fn scalarText(alloc: std.mem.Allocator, db: *SqliteBackend, sql: []const u8, arg
     return null;
 }
 
-/// Run a single-column SELECT and return ALL rows' first column as
-/// owned slices. Caller frees the outer slice AND each inner slice
-/// via `freeAll`.
+/// Return every row's first column as owned slices; the caller frees the outer
+/// slice and each inner slice via `freeAll`.
 fn allScalarText(alloc: std.mem.Allocator, db: *SqliteBackend, sql: []const u8, args: []const []const u8) ![]const []u8 {
     var q = try db.query(alloc, sql, args);
     defer q.deinit();
@@ -153,7 +76,6 @@ fn freeAll(alloc: std.mem.Allocator, items: []const []u8) void {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group 1: Lifecycle
-// ═══════════════════════════════════════════════════════════════════════════
 
 test "init :memory: opens successfully and is queryable" {
     const alloc = testing.allocator;
@@ -179,9 +101,8 @@ test "init on bad path (non-existent dir) returns DatabaseNotFound" {
     var db: SqliteBackend = .{};
     defer db.deinit();
 
-    // /nonexistent-root/nope/nope.db — the parent dirs don't exist
-    // and sqlite3_open returns SQLITE_CANTOPEN which the wrapper
-    // maps to DatabaseNotFound.
+    // /nonexistent-root/nope/nope.db: the parent dirs don't exist, so
+    // sqlite3_open returns SQLITE_CANTOPEN, which the wrapper maps to DatabaseNotFound.
     const result = db.init(io, "/nonexistent-root-1234567890/nope/nope.db");
     try testing.expectError(sqlite_mod.Error.DatabaseNotFound, result);
 }
@@ -199,9 +120,8 @@ test "init on a directory path returns an error" {
     // /tmp is always a directory. Open-as-db returns SQLITE_CANTOPEN
     // (cannot open as database file).
     const result = db.init(io, "/tmp");
-    // Both DatabaseNotFound and OpenFailed are acceptable mappings
-    // for "can't open the file as a database" — the contract is that
-    // SOME error is returned, not that the call silently succeeds.
+    // Both DatabaseNotFound and OpenFailed are valid for "can't open the file as
+    // a database" — the contract is only that some error is returned.
     try testing.expect(result == sqlite_mod.Error.DatabaseNotFound or result == sqlite_mod.Error.OpenFailed);
 }
 
@@ -229,9 +149,8 @@ test "init on file-backed path creates the file" {
     if (builtin.os.tag == .windows) return;
     const alloc = testing.allocator;
 
-    // Use a static literal (sentinel-terminated) so the type matches
-    // `init`'s `[:0]const u8` parameter. `defer deleteFile` cleans up
-    // after the test so subsequent runs start fresh.
+    // A static literal is sentinel-terminated, matching `init`'s `[:0]const u8`;
+    // `defer deleteFile` keeps later runs starting fresh.
     const path = "/tmp/nalar_sqlite_test_create.db";
     var threaded = std.Io.Threaded.init(alloc, .{});
     defer threaded.deinit();
@@ -253,7 +172,6 @@ test "init on file-backed path creates the file" {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group 2: exec
-// ═══════════════════════════════════════════════════════════════════════════
 
 test "exec CREATE TABLE works" {
     var ctx = try setupDb();
@@ -370,10 +288,8 @@ test "exec INSERT with single quotes in arg is escaped safely (no SQL injection)
 }
 
 test "exec with empty SQL is a successful no-op" {
-    // Documented SQLite behavior: an empty SQL string is a successful
-    // no-op (sqlite3_prepare_v2 returns OK, sqlite3_step returns SQLITE_DONE).
-    // This is different from many SQL libraries that treat empty SQL as
-    // a syntax error. The wrapper preserves this — exec returns OK.
+    // An empty SQL string is a successful no-op, not a syntax error — SQLite's
+    // documented behavior, preserved by the wrapper (prepare_v2 returns OK).
     var ctx = try setupDb();
     defer teardown(&ctx);
     const alloc = testing.allocator;
@@ -392,12 +308,8 @@ test "exec with malformed SQL returns PrepareFailed" {
 }
 
 test "exec with too few args binds NULL for missing placeholders" {
-    // SQLite's documented behavior: when a bound parameter has no
-    // matching `?` placeholder, the wrapper simply doesn't bind it.
-    // When a `?` placeholder has no bound parameter, it defaults to
-    // NULL at step() time. So "too few args" with a nullable column
-    // succeeds with NULL. To get BindFailed, the column must be NOT
-    // NULL or we need too MANY args (out-of-range index).
+    // A `?` with no bound parameter defaults to NULL at step() time, so "too few
+    // args" succeeds on a nullable column; BindFailed needs too MANY args.
     var ctx = try setupDb();
     defer teardown(&ctx);
     const alloc = testing.allocator;
@@ -466,10 +378,8 @@ test "exec on UNIQUE violation returns ExecuteFailed" {
 }
 
 test "exec on duplicate CREATE TABLE returns PrepareFailed" {
-    // SQLite parses the CREATE TABLE statement at prepare_v2 time
-    // and rejects it because the table already exists. The error
-    // surfaces as a PREPARE error (SQLITE_ERROR from prepare_v2),
-    // not an EXECUTE error (which only fires on step() failure).
+    // A duplicate CREATE TABLE fails at prepare_v2 time because the table already
+    // exists, so it surfaces as PrepareFailed, not ExecuteFailed (a step() error).
     var ctx = try setupDb();
     defer teardown(&ctx);
     const alloc = testing.allocator;
@@ -535,11 +445,8 @@ test "exec of multi-statement SQL only runs the first (sqlite3_prepare_v2 semant
     defer teardown(&ctx);
     const alloc = testing.allocator;
 
-    // Multi-statement SQL: prepare_v2 only prepares the first.
-    // The exec helper does NOT iterate subsequent statements —
-    // so the second statement (a no-op SELECT) is silently dropped.
-    // The contract is: the first statement's effect is committed, the
-    // rest are ignored. We test the documented behavior.
+    // Only the first statement of multi-statement SQL is prepared and executed;
+    // the rest are silently ignored (sqlite3_prepare_v2 semantics).
     try ctx.db.exec(alloc,
         \\CREATE TABLE foo (id INTEGER PRIMARY KEY);
         \\SELECT 1;
@@ -552,7 +459,6 @@ test "exec of multi-statement SQL only runs the first (sqlite3_prepare_v2 semant
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group 3: queryRow
-// ═══════════════════════════════════════════════════════════════════════════
 
 test "queryRow returns the single matching row" {
     var ctx = try setupDb();
@@ -663,7 +569,6 @@ test "queryRow on closed/uninitialized db returns DatabaseNotFound" {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group 4: query (multi-row iterator)
-// ═══════════════════════════════════════════════════════════════════════════
 
 test "query with no rows returns iterator that yields null" {
     var ctx = try setupDb();
@@ -764,10 +669,8 @@ test "query with many columns (5+) reads all of them" {
 }
 
 test "Rows.next() after DONE returns null (defensive against SQLITE_MISUSE)" {
-    // Calling step() on a statement that has already returned DONE
-    // triggers SQLITE_MISUSE per the SQLite API contract. The wrapper
-    // treats that case the same as DONE — returning null — so callers
-    // don't have to special-case "stopped calling too early".
+    // step() on a statement that already returned DONE triggers SQLITE_MISUSE;
+    // the wrapper treats that as DONE and returns null, so over-stepping is safe.
     var ctx = try setupDb();
     defer teardown(&ctx);
     const alloc = testing.allocator;
@@ -812,9 +715,8 @@ test "Rows.deinit is safe to call after partial iteration" {
 }
 
 test "Row.deinit is safe with zero columns (0-column row)" {
-    // SQLite's `SELECT 1 WHERE 0` produces a 1-column result with 0 rows.
-    // We test the inverse: a row with multiple columns but all NULL,
-    // which produces values of length 0 each.
+    // SQLite's `SELECT 1 WHERE 0` yields 1 column and 0 rows; this test is the
+    // inverse — several columns, all NULL, so each value has length 0.
     var ctx = try setupDb();
     defer teardown(&ctx);
     const alloc = testing.allocator;
@@ -863,7 +765,6 @@ test "query iterates many rows (100) without leaks" {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group 5: changes()
-// ═══════════════════════════════════════════════════════════════════════════
 
 test "changes() reflects INSERT (1)" {
     var ctx = try setupDb();
@@ -942,7 +843,6 @@ test "changes() called before init returns 0 (not a crash)" {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group 6: Error variant contract
-// ═══════════════════════════════════════════════════════════════════════════
 
 test "exec before init returns DatabaseNotFound" {
     var db: SqliteBackend = .{};
@@ -962,7 +862,6 @@ test "query before init returns DatabaseNotFound" {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group 7: Transaction (tx commit/rollback via API — never raw BEGIN/COMMIT)
-// ═══════════════════════════════════════════════════════════════════════════
 
 test "tx commit commits inserts" {
     var ctx = try setupDb();
@@ -1006,7 +905,6 @@ test "tx rollback undoes inserts" {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group 8: SQLite-specific features
-// ═══════════════════════════════════════════════════════════════════════════
 
 test "PRAGMA user_version round-trips through exec/queryRow" {
     var ctx = try setupDb();
@@ -1069,10 +967,8 @@ test "exec with the same prepared statement pattern across calls works" {
 }
 
 test "exec with binary-safe binding (no NUL terminator in arg)" {
-    // The arg is a slice — `bind_text` with `len` parameter does NOT
-    // require a NUL terminator. We verify this works by binding the
-    // exact bytes (no NUL inside; just a non-NUL-terminated tail in
-    // the test buffer).
+    // `bind_text` takes an explicit length and needs no NUL terminator: the bound
+    // bytes are copied verbatim, NUL-free.
     var ctx = try setupDb();
     defer teardown(&ctx);
     const alloc = testing.allocator;
@@ -1099,7 +995,6 @@ test "exec with binary-safe binding (no NUL terminator in arg)" {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group 9: Transaction struct (begin / tx.exec / commit / rollback)
-// ═══════════════════════════════════════════════════════════════════════════
 
 test "begin returns a Transaction and commit persists writes" {
     var ctx = try setupDb();
@@ -1135,10 +1030,8 @@ test "rollback after commit returns TransactionClosed (single-use enforcement)" 
     try tx.exec(alloc, "INSERT INTO foo VALUES ('a')", &.{});
     try tx.commit();
 
-    // After commit, the tx is single-use. Rollback returns
-    // Error.TransactionClosed (NOT a silent no-op — the mutex was
-    // released by commit, so a rollback would invoke SQL on the
-    // connection without holding the mutex, racing with other writers).
+    // After commit the tx is single-use: rollback returns TransactionClosed rather
+    // than a silent no-op, because commit released the mutex that rollback needs.
     const result = tx.rollback();
     try testing.expectError(sqlite_mod.Error.TransactionClosed, result);
 
@@ -1234,9 +1127,8 @@ test "read-modify-write pattern is atomic across tx" {
     , &.{});
     try ctx.db.exec(alloc, "INSERT INTO counter VALUES (1, 0)", &.{});
 
-    // Simulate a read-modify-write: read n, increment, write back.
-    // Inside a tx, the read + write happen atomically with respect to
-    // other writers.
+    // Read-modify-write: inside a tx the read and the write are atomic with respect
+    // to other writers.
     {
         var tx = try ctx.db.begin();
         defer tx.rollback() catch {};
@@ -1412,12 +1304,8 @@ test "nested savepoints (depth 2 -> 3) commit and rollback correctly" {
 }
 
 test "backend.deinit() while tx is open: tx.commit returns DatabaseNotFound" {
-    // This test verifies the use-after-free guard: if the caller
-    // closes the backend while a tx is in flight, commit() detects
-    // the closed state (db == null — set by Task 1.0's deinit fix)
-    // and returns DatabaseNotFound instead of dereferencing a freed
-    // pointer. Requires Task 1.0 (deinit nulls out self.db) to be in
-    // place — without it, the guard never fires.
+    // Use-after-free guard: `deinit()` nulls `self.db`, so committing a tx whose
+    // backend was closed mid-flight returns DatabaseNotFound instead of dereferencing it.
     var ctx = try setupDb();
     defer teardown(&ctx);
     const alloc = testing.allocator;
@@ -1453,9 +1341,8 @@ test "backend.deinit() while tx is open: tx.rollback returns DatabaseNotFound" {
 }
 
 test "tx.commit after commit returns TransactionClosed (single-use enforcement)" {
-    // After a successful commit, the tx is single-use. Any further call
-    // returns Error.TransactionClosed to prevent UB (mutex is no longer
-    // held, so a tx.* call would race with concurrent writers).
+    // After a successful commit the tx is single-use and any further call returns
+    // TransactionClosed — the mutex is gone, so a tx.* call would race writers.
     var ctx = try setupDb();
     defer teardown(&ctx);
     const alloc = testing.allocator;
@@ -1479,9 +1366,8 @@ test "tx.commit after commit returns TransactionClosed (single-use enforcement)"
 }
 
 test "defer tx.rollback() catch |err| switch (TransactionClosed => {}) is the safe idiom" {
-    // The whole point of defer-rollback: if commit() already ran, the
-    // deferred rollback returns TransactionClosed and we swallow it.
-    // Otherwise it runs the actual rollback.
+    // The point of defer-rollback: if commit() already ran, the deferred rollback
+    // returns TransactionClosed and is swallowed; otherwise it does the rollback.
     var ctx = try setupDb();
     defer teardown(&ctx);
     const alloc = testing.allocator;
@@ -1491,10 +1377,8 @@ test "defer tx.rollback() catch |err| switch (TransactionClosed => {}) is the sa
 
     {
         var tx = try ctx.db.begin();
-        // Zig 0.16 forbids `return` from a `defer` expression, so the
-        // deferred rollback must swallow ALL errors. The only error
-        // expected here is TransactionClosed (commit() succeeded), so
-        // swallowing is the right behavior for this idiom.
+        // Zig 0.16 forbids `return` from a `defer`, so this deferred rollback must
+        // swallow every error; the only one possible here is TransactionClosed.
         defer tx.rollback() catch {};
         try tx.exec(alloc, "INSERT INTO foo VALUES ('a')", &.{});
         try tx.commit();
@@ -1506,11 +1390,8 @@ test "defer tx.rollback() catch |err| switch (TransactionClosed => {}) is the sa
     try testing.expectEqualStrings("1", cnt);
 }
 test "integration: atomic INSERT-then-UPDATE (mirrors insert_llm_histories pattern)" {
-    // This test mirrors the canonical tx use case in nalar:
-    // inserting a row that references a parent, then updating the
-    // parent's metadata in the same operation. Without tx, a crash
-    // between the INSERT and UPDATE leaves the parent row's metadata
-    // stale relative to the inserted child.
+    // The canonical tx use case: INSERT a row referencing a parent, then UPDATE the
+    // parent in the same tx — a crash between them would leave its metadata stale.
     var ctx = try setupDb();
     defer teardown(&ctx);
     const alloc = testing.allocator;
@@ -1617,9 +1498,8 @@ test "commitOrRollback after explicit commit is a silent no-op (not TransactionC
     try tx.exec(alloc, "INSERT INTO foo VALUES ('a')", &.{});
     try tx.commit();
 
-    // The key test: commitOrRollback on an already-committed tx must
-    // succeed silently (NOT return Error.TransactionClosed — that
-    // would defeat the purpose of the defer idiom).
+    // commitOrRollback on an already-committed tx must succeed silently, NOT return
+    // TransactionClosed — returning it would defeat the whole defer idiom.
     try tx.commitOrRollback();
 
     const cnt = (try scalarText(alloc, &ctx.db,
@@ -1651,9 +1531,8 @@ test "commitOrRollback after explicit rollback is a silent no-op" {
 }
 
 test "commitOrRollback inside a savepoint commits the savepoint (not the outer tx)" {
-    // Inside a savepoint, commitOrRollback should issue RELEASE sp_<n>
-    // (the savepoint's commit), not COMMIT (the outer tx's commit).
-    // After the savepoint commits, the outer tx remains alive.
+    // In a savepoint, commitOrRollback issues RELEASE sp_<n> (the savepoint's commit),
+    // not COMMIT — and the outer tx is still alive afterwards.
     var ctx = try setupDb();
     defer teardown(&ctx);
     const alloc = testing.allocator;
