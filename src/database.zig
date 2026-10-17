@@ -89,17 +89,33 @@ pub fn open(db: *Db, io: std.Io, cfg: OpenConfig) Error!void {
 /// can name it without reaching into the `sqlite` namespace.
 pub const SqliteConfig = sqlite_mod.Config;
 
-/// Open `db` with an explicit SQLite connection policy. `sqlite_config` is IGNORED
-/// on the postgres backend (no pragmas), which is what keeps call sites compiling under both.
+/// Open `db` with an explicit SQLite connection policy. `sqlite_config` is IGNORED on the postgres backend (no pragmas), which is what keeps call sites
+/// compiling under both. Prefer `openConfigured` whenever the backend may be postgres: this entry point cannot reach it at all.
 pub fn openWithConfig(db: *Db, io: std.Io, cfg: OpenConfig, sqlite_config: SqliteConfig) Error!void {
+    return openConfigured(db, io, cfg, .{ .sqlite = sqlite_config });
+}
+
+/// The postgres connection policy, re-exported like `SqliteConfig`. A sqlite-only build resolves it
+/// to an empty struct: the module that defines the real one is not compiled in.
+pub const PostgresConfig = if (backend_is_postgres) postgres_mod.Config else struct {};
+
+/// Both backends' policies at once. The one that does not match the compiled backend is IGNORED, so a
+/// call site stays identical whichever `-Ddb_used` list the app was built with.
+pub const Config = struct {
+    sqlite: SqliteConfig = .{},
+    postgres: PostgresConfig = .{},
+};
+
+/// Open `db` with both backends' policies — `openWithConfig` generalised.
+pub fn openConfigured(db: *Db, io: std.Io, cfg: OpenConfig, config: Config) Error!void {
     if (backend_is_postgres) {
         switch (cfg) {
             .sqlite_path => unreachable, // `-Ddb_used` said postgres; a sqlite path cannot arrive here
-            .postgres_conninfo => |c| try db.init(io, c),
+            .postgres_conninfo => |c| try db.initWithConfig(io, c, config.postgres),
         }
     } else {
         switch (cfg) {
-            .sqlite_path => |p| try db.initWithConfig(io, p, sqlite_config),
+            .sqlite_path => |p| try db.initWithConfig(io, p, config.sqlite),
             .postgres_conninfo => unreachable,
         }
     }
