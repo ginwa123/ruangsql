@@ -1,21 +1,5 @@
-//! Deterministic benchmark harness for the sqlite backend.
-//!
-//! Measures the four hot paths a server actually exercises:
-//!
-//!   insert      — `exec` on a cached prepared INSERT
-//!   point_read  — `queryRow` on a cached prepared SELECT by primary key
-//!   range_read  — `query` + `Rows.next` over a LIMITed result set
-//!   tx_write    — `begin` → 3 writes → `commit` (BEGIN IMMEDIATE)
-//!
-//! Determinism: the workload is generated from a fixed-seed xorshift PRNG,
-//! so every run inserts the same rows in the same order and reads the same
-//! keys. Nothing in the measured loop reads a wall clock except the timer
-//! itself, and each phase is repeated `REPS` times with the median reported.
-//! Every phase also accumulates a checksum over the values it read back, so
-//! a run that silently returns different data cannot look like a fast run.
-//!
-//! Output is a single JSON object on stdout so a container run can be
-//! diffed against another.
+//! Deterministic sqlite benchmark of the four hot paths (insert, point_read,
+//! range_read, tx_write): fixed-seed workload, per-phase checksum, JSON on stdout.
 
 const std = @import("std");
 
@@ -26,9 +10,8 @@ const SEED: u64 = 0x5eed_1234_dead_beef;
 const ROWS: usize = 5_000;
 const REPS: usize = 5;
 
-/// Fixed-seed xorshift64*. Deterministic across platforms and Zig
-/// versions, unlike `std.Random.DefaultPrng` whose algorithm is not
-/// guaranteed stable.
+/// Fixed-seed xorshift64*. Deterministic across platforms and Zig versions, unlike
+/// `std.Random.DefaultPrng`, whose algorithm is not guaranteed stable.
 const Rng = struct {
     state: u64,
 
@@ -50,9 +33,8 @@ const Rng = struct {
     }
 };
 
-/// Monotonic stopwatch over `Io.Clock.awake`. `std.time.Timer` no longer
-/// exists in Zig 0.16, and the Io clock is what the backend itself uses,
-/// so the two cannot drift apart.
+/// Monotonic stopwatch over `Io.Clock.awake`: `std.time.Timer` is gone in Zig 0.16,
+/// and the backend uses the same clock, so the two cannot drift apart.
 const Timer = struct {
     start: std.Io.Timestamp,
 
@@ -104,10 +86,8 @@ const Bench = struct {
         , &.{});
     }
 
-    /// Fill the table with `ROWS` deterministic rows. Not measured.
-    ///
-    /// Every bind argument is formatted into a stack buffer, so seeding
-    /// allocates nothing and cannot pollute the leak report.
+    /// Fill the table with `ROWS` deterministic rows; not measured. Every bind argument
+    /// is formatted into a stack buffer, so seeding allocates nothing (clean leak report).
     fn seed(self: *Bench) !void {
         var rng = Rng.init(SEED);
         var tx = try self.db.begin();
@@ -262,9 +242,8 @@ const Bench = struct {
 };
 
 pub fn main() !void {
-    // A plain arena: the benchmark's own bookkeeping is not what is being
-    // measured, and a tracking allocator in the hot path would dominate
-    // every number below.
+    // A plain arena: the benchmark's own bookkeeping is not what is measured, and a
+    // tracking allocator in the hot path would dominate every number below.
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -273,9 +252,8 @@ pub fn main() !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    // A file-backed DB: WAL, mmap and the reader pool all behave the way
-    // they do in production, unlike `:memory:` which skips pooling
-    // entirely. The path is fixed so the container run is reproducible.
+    // A file-backed DB: WAL, mmap and the reader pool behave as in production, unlike
+    // `:memory:` which skips pooling. Fixed path, so container runs are reproducible.
     const db_path = try alloc.dupeZ(u8, "/tmp/ruangsql-bench/bench.db");
     std.Io.Dir.cwd().deleteFile(io, db_path) catch {};
     std.Io.Dir.cwd().createDirPath(io, "/tmp/ruangsql-bench") catch {};

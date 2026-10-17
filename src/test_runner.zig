@@ -12,9 +12,8 @@ test {
     // Reader pooling (`Config.read_conns`). Separate from the fastpath
     // file because that one opens `:memory:`, which pooling skips.
     _ = @import("sqlite/sqlite_pool_test.zig");
-    // Postgres tests only when the app listed postgres in `-Ddb_used`.
-    // They need a live PG server; sqlite-only builds (the default)
-    // skip them entirely so `zig build test` works without libpq.
+    // Postgres tests only when the app listed postgres in `-Ddb_used` — they need a
+    // live PG server; sqlite-only builds (the default) skip them so `zig build test` works without libpq.
     if (build_options.enable_postgres) {
         _ = @import("postgres/postgres_test.zig");
         _ = @import("postgres/test_helpers_test.zig");

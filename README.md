@@ -62,3 +62,31 @@ zig build test -Dforce-vendor=true              # force the vendored amalgamatio
 Postgres tests need a live server; without one they self-skip (pass with
 no assertions) via `test_helpers.getOrStartTestInstance`. CI provides a
 postgres service on Ubuntu for real coverage.
+
+## Lint
+
+Every `.zig` file in the package is checked by **zginlint**
+([github.com/ginwa123/zglint](https://github.com/ginwa123/zglint)), a
+std-only linter pinned by URL + hash in `build.zig.zon`:
+
+```sh
+zig build zginlint        # install the CLI into zig-out/bin/zginlint
+zig build zginlint:check  # the gate: src + bench + build.zig, zero findings
+```
+
+Two rules run, both at zero tolerance — there is no baseline, no per-file
+ceiling and no suppression comment:
+
+- `zginlint/max-comment-lines` — a **comment block** (a run of consecutive
+  comment-only lines) may be at most **2 lines**. `///` doc comments and
+  `//!` container docs count like any other comment; a blank line or a line
+  carrying code ends the block, and a trailing comment after code is never
+  counted.
+- `zginlint/no-catch-unreachable` — the banned `catch` + `unreachable`
+  pair, which panics without a message in Debug/ReleaseSafe and is
+  undefined behaviour in ReleaseFast. Use `catch @panic("...")` instead.
+  The scan is over raw bytes, so even a prose mention of the pair inside
+  a scanned path counts as a finding.
+
+CI runs the same gate as the `zginlint` job, so a comment block over the
+ceiling fails the build instead of drifting back in.

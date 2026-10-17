@@ -1,44 +1,11 @@
-//! `databases` package — self-contained Zig package that exposes the
-//! sqlite3 + libpq bindings used by nalarcore.
-//!
-//! Consumers (`b.dependency("databases", .{...})`) get the right sqlite3
-//! + openssl + libpq link line + include paths based on the TARGET they
-//! pass in, so a Linux native build, a Linux → Windows cross-compile and a
-//! macOS native build each pick up the correct deps automatically.
-//!
-//! Why per-TARGET (not per-Compile from the consumer): the consumer
-//! build.zig's `linkPlatformDeps` no longer needs to know about
-//! sqlite3 / openssl / libpq. The databases module carries those deps
-//! for its own target, and Zig's module-graph dep propagation handles
-//! the rest.
-//!
-//! ## System-deps probe
-//!
-//! In addition to the vendored sqlite3 amalgamation, this package probes
-//! the host system at build config time for sqlite3 + libpq + openssl.
-//! If the host has all of them (the normal case on Arch / Debian /
-//! Fedora / Ubuntu dev hosts), the package links the system sqlite3 via
-//! `linkSystemLibrary("sqlite3")` and skips the 9 MB amalgamation
-//! compile entirely.
-//!
-//! Override with `-Dforce-vendor=true` to always compile the vendored
-//! amalgamation (useful for CI runners + testing the vendored path).
+//! `databases` package — self-contained Zig package exposing the sqlite3 + libpq bindings
+//! used by nalarcore; per-target system-lib probing with a vendored amalgamation fallback.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// Cross-platform "does this file exist" check used by the system-deps
-/// probe below. Host-OS-specific direct syscalls via `std.os`, NOT
-/// `std.c` — build.zig doesn't link libc by default (Zig 0.16 requires an
-/// explicit `link_libc = true` on the build runner module for `std.c` to
-/// resolve `fopen`).
-///
-///   - Linux:   `faccessat(AT_FDCWD, path, mode=0)` returns 0 when
-///              the file exists.
-///   - macOS:   same `faccessat` (POSIX).
-///   - Windows: `GetFileAttributesW` returns INVALID_FILE_ATTRIBUTES on
-///              missing; existence = attrs != invalid AND attrs doesn't
-///              have the DIRECTORY bit set (mirror `test -f`).
+/// Cross-platform "does this file exist" check for the probe: direct syscalls rather
+/// than `std.c` (no libc linked by default); Windows must also exclude the DIRECTORY bit.
 fn fileExists(absolute_path: []const u8) bool {
     var buf: [std.fs.max_path_bytes:0]u8 = undefined;
     if (absolute_path.len >= buf.len) return false;
@@ -49,9 +16,8 @@ fn fileExists(absolute_path: []const u8) bool {
             const rc = std.os.linux.faccessat(std.os.linux.AT.FDCWD, &buf, 0, 0);
             break :blk rc == 0;
         },
-        // macOS: libc `access()` — same F_OK check as `test -f`.
-        // (The build runner links libc, so the extern is always
-        // resolvable; no shell-out needed.)
+        // macOS: libc `access()` — same F_OK check as `test -f`; the extern always
+        // resolves because the build runner links libc.
         .macos => blk: {
             const rc = std.c.access(&buf, 0); // F_OK = 0
             break :blk rc == 0;
@@ -86,26 +52,11 @@ const SystemLibs = struct {
     use_system_crypto: bool,
 };
 
-/// Probe the host system for sqlite3 + libpq + openssl.
-///
-/// Runs `sh -c` synchronously at build config time (via
-/// `std.process.run`) and parses 6 boolean fields out of its stdout.
-/// The probe runs in ~25 ms on a typical Linux host — cheap enough
-/// to re-run on every `zig build` invocation (no caching needed).
-///
-/// Only Linux is probed. macOS Homebrew sqlite3 is keg-only; Windows
-/// needs explicit .lib paths; both fall back to vendor. Cross-compile
-/// (Linux host → Windows target) also falls back to vendor because
-/// the probe checks the HOST's system libs, not the TARGET's.
-///
-/// `target` is the COMPILE's resolved target. Cross-compile always
-/// returns "no system libs" because the host's libs are for the host
-/// OS, not the target OS.
+/// Probe the HOST system for sqlite3 + libpq + openssl at build-config time (~25 ms;
+/// no caching). Only native builds qualify — a cross-compile's host libs are the wrong OS.
 pub fn probeSystemLibs(b: *std.Build, target: std.Build.ResolvedTarget) SystemLibs {
-    // Only native (target == host) goes system-only. Cross-compile
-    // (Linux host → macOS target, or vice versa) always falls back
-    // to the vendored amalgamation because the host's libs are for
-    // the host OS, not the target OS.
+    // Only native (target == host) goes system-only; a cross-compile targets another
+    // OS, so its host libs are unusable and it always falls back to the vendored path.
     if (target.result.os.tag != b.graph.host.result.os.tag) {
         return .{
             .use_system_sqlite3 = false,
@@ -115,19 +66,8 @@ pub fn probeSystemLibs(b: *std.Build, target: std.Build.ResolvedTarget) SystemLi
         };
     }
 
-    // Linux: libpq-fe.h location varies by distro — Arch Linux has it
-    // at /usr/include/libpq-fe.h directly, Debian/Ubuntu at
-    // /usr/include/postgresql/libpq-fe.h. Check both.
-    //
-    // macOS: Homebrew ships keg-only sqlite3 + libpq at
-    // /opt/homebrew/opt/<name>/{include,lib}/. There is no ldconfig
-    // on macOS — we test the .dylib file directly. The probe accepts
-    // either the keg-only path OR the system /usr/include (rare but
-    // documented for completeness).
-    //
-    // Pure-Zig probe (no shell, no `bash`/`sh` dependency): a Windows dev
-    // box without `bash` on PATH would spawn-fail and fall through to the
-    // vendored path even when vcpkg already had the libraries installed.
+    // libpq-fe.h is at /usr/include/postgresql on Debian/Ubuntu and directly in
+    // /usr/include on Arch — check both. Pure-Zig (no `sh`), so Windows needs no bash.
     var sqlite_hdr: bool = false;
     var sqlite_lib: bool = false;
     var pq_hdr: bool = false;
@@ -137,9 +77,8 @@ pub fn probeSystemLibs(b: *std.Build, target: std.Build.ResolvedTarget) SystemLi
     var crypto_lib: bool = false;
     switch (b.graph.host.result.os.tag) {
         .linux => {
-            // Debian/Ubuntu use multiarch lib dirs
-            // (/usr/lib/<triplet>/...), Arch/Fedora use /usr/lib/ directly.
-            // Check both layouts.
+            // Arch/Fedora install into /usr/lib/ directly; Debian/Ubuntu use
+            // multiarch /usr/lib/<triplet>/ — probe both layouts.
             sqlite_hdr = fileExists("/usr/include/sqlite3.h");
             sqlite_lib = fileExists("/usr/lib/libsqlite3.so") or
                 fileExists("/usr/lib/x86_64-linux-gnu/libsqlite3.so") or
@@ -178,9 +117,8 @@ pub fn probeSystemLibs(b: *std.Build, target: std.Build.ResolvedTarget) SystemLi
                 fileExists("/usr/lib/libcrypto.dylib");
         },
         .windows => {
-            // Header-only on vcpkg (Windows): lib filenames differ
-            // between MSVC and MinGW toolchains — rely on the linker
-            // to surface `file not found` if the lib is missing.
+            // Header-only probe (vcpkg): MSVC and MinGW name the .lib files
+            // differently, so let the linker report a missing one instead.
             sqlite_hdr = fileExists("C:/vcpkg/installed/x64-windows/include/sqlite3.h");
             pq_hdr = fileExists("C:/vcpkg/installed/x64-windows/include/libpq-fe.h");
             ssl_hdr = fileExists("C:/vcpkg/installed/x64-windows/include/openssl/ssl.h");
@@ -196,18 +134,8 @@ pub fn probeSystemLibs(b: *std.Build, target: std.Build.ResolvedTarget) SystemLi
         },
     }
 
-    // Header-only probe on Windows (vcpkg): the package links against the
-    // vcpkg sysroot and relies on the linker's search path to find the
-    // .lib files. If the lib is missing the linker reports
-    // `file not found` with a clear diagnostic. This avoids the
-    // per-toolchain lib-name enum (MSVC `sqlite3.lib` vs MinGW
-    // `libsqlite3.lib` vs `sqlite3.dll.lib`).
-    //
-    // On Linux / macOS we ALSO require the matching .so / .dylib to be
-    // present — a header-only dev install (sqlite3-dev but no libsqlite3
-    // runtime) would compile fine but fail at runtime. Cross-checking the
-    // .so path is a cheap O(1) `faccessat` per probe field and saves the
-    // consumer from a confusing `dyld: Library not loaded` at first use.
+    // Windows probes headers only (vcpkg sysroot; the linker reports a missing .lib);
+    // Linux/macOS must ALSO have the .so/.dylib or a header-only install fails at load.
     const use_system_sqlite3 = sqlite_hdr and switch (b.graph.host.result.os.tag) {
         .windows => true,
         else => sqlite_lib,
@@ -242,11 +170,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Path to the vendored sqlite3 amalgamation, relative to this
-    // package's build.zig. Default is `vendor/sqlite3/` co-located with
-    // this build.zig (the package owns its own vendor dir — the fetch
-    // script at scripts/fetch-vendor-sqlite3.sh populates it).
-    // Override with `-Dvendor-dir=...` if you move it elsewhere.
+    // Vendored sqlite3 amalgamation dir, relative to this build.zig; the fetch script
+    // scripts/fetch-vendor-sqlite3.sh populates it. Override with `-Dvendor-dir=...`.
     const vendor_dir = b.option(
         []const u8,
         "vendor-dir",
@@ -261,24 +186,16 @@ pub fn build(b: *std.Build) void {
         "Skip the system probe and always compile the vendored sqlite3 amalgamation",
     ) orelse false;
 
-    // Force the vendored sqlite3 amalgamation even when the probe finds
-    // system sqlite3. libpq/openssl still follow the probe — only the
-    // sqlite3 link switches to vendored. Useful when the system sqlite3
-    // lacks FTS5 (e.g. stock vcpkg builds ship without the fts5 module,
-    // which this package's tests require).
+    // Force the vendored sqlite3 amalgamation even when the probe finds system sqlite3 —
+    // needed when the system lib lacks FTS5 (stock vcpkg). libpq/openssl still follow the probe.
     const sqlite_vendor = b.option(
         bool,
         "sqlite-vendor",
         "Always compile the vendored sqlite3 amalgamation (with FTS5) instead of linking system sqlite3; libpq/openssl still follow the system probe",
     ) orelse false;
 
-    // Backend list — set by the app's root build.zig (`-Ddb_used`),
-    // forwarded verbatim via `b.dependency("databases", ...)`.
-    // Comma-separated (the build runner only passes strings on the
-    // CLI — no array-of-string option kind exists). Default `"sqlite"`
-    // = sqlite-only: Postgres.zig is never @imported, libpq is never
-    // linked, pg tests are skipped. Standalone `zig build test` inside
-    // this package also defaults to sqlite-only.
+    // Backend list for `-Ddb_used` (comma-separated — the CLI passes strings only),
+    // forwarded by the app's root build.zig. The default "sqlite" never links libpq.
     const db_used_str = b.option(
         []const u8,
         "db_used",
@@ -306,20 +223,14 @@ pub fn build(b: *std.Build) void {
     mod.linkSystemLibrary("c", .{});
     mod.link_libc = true;
 
-    // Expose the backend choice to source as `@import("build_options")`.
-    // `database.zig` / `root.zig` / `test_runner.zig` read
-    // `build_options.enable_postgres` at comptime: the unchosen branch
-    // is discarded before `@cImport` runs, so sqlite-only builds never
-    // need libpq headers or libs even though Postgres.zig is on disk.
+    // `build_options.enable_postgres` is read at comptime, so the unchosen branch is
+    // dropped before `@cImport` — sqlite-only builds need no libpq headers at all.
     const build_options = b.addOptions();
     build_options.addOption(bool, "enable_postgres", enable_postgres);
     mod.addOptions("build_options", build_options);
 
-    // Probe host system for sqlite3 + libpq + openssl. When the probe
-    // finds usable system libs (typical Arch / Debian / Fedora dev
-    // hosts), link them and skip the vendored amalgamation entirely.
-    // Otherwise fall back to the vendored amalgamation (works on every
-    // host with a C compiler).
+    // Probe the host: usable system libs are linked directly, otherwise fall back to the
+    // vendored amalgamation, which works on any host with a C compiler.
     const sys = if (force_vendor) SystemLibs{
         .use_system_sqlite3 = false,
         .use_system_pq = false,
@@ -327,28 +238,16 @@ pub fn build(b: *std.Build) void {
         .use_system_crypto = false,
     } else probeSystemLibs(b, target);
 
-    // sqlite3 header path — needed by `@cImport(@cInclude("sqlite3.h"))`
-    // inside src/sqlite/Sqlite.zig. On system path: /usr/include is
-    // already on the cimport search path so no addIncludePath needed.
-    // On vendor path: the amalgamation co-locates sqlite3.h with the
-    // .c file in vendor/sqlite3/, so we add that include path.
+    // Header path for `@cImport(@cInclude("sqlite3.h"))` in src/sqlite/Sqlite.zig: on the
+    // system path /usr/include is already searched; the vendor dir co-locates header and .c.
     if (!sys.use_system_sqlite3) {
         mod.addIncludePath(b.path(vendor_dir));
     } else {
-        // Explicit /usr/include for cimport (most distros have it by
-        // default but cross-compile toolchains may not). On macOS we
-        // also need the brew keg-only path because the probe accepted
-        // either layout.
-        //
-        // Windows: do NOT add `/usr/include` — it doesn't exist there
-        // (vcpkg headers live at C:/vcpkg/installed/x64-windows/include,
-        // added separately in the Windows branch below). The path would
-        // resolve to a non-existent UNC-style `\\usr\include` and
-        // translate-c would fail.
+        // Only Linux gets /usr/include here: on Windows that path resolves to a bogus
+        // UNC-style directory and translate-c fails (vcpkg headers are added below).
         if (target.result.os.tag == .macos) {
-            // Brew keg-only layouts: formula `sqlite` lives at
-            // opt/sqlite (NOT opt/sqlite3); keep the sqlite3 alternate
-            // for hosts that have it under that name.
+            // Keg-only: formula `sqlite` lives at opt/sqlite (NOT opt/sqlite3);
+            // both paths are added for hosts using either name.
             mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/sqlite/include" });
             mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/sqlite3/include" });
         }
@@ -357,12 +256,8 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    // Compile flags mirror the existing project convention:
-    //   - SQLITE_THREADSAFE=1       — multi-threaded app, mutexes OK
-    //   - SQLITE_OMIT_LOAD_EXTENSION — don't expose the loadable-ext API
-    //   - SQLITE_ENABLE_FTS5         — required for the project's FTS5
-    //                                  indexes (save_memory, search_history,
-    //                                  llm_history)
+    // Flags mirror the project convention: SQLITE_THREADSAFE=1 (multi-threaded app),
+    // SQLITE_OMIT_LOAD_EXTENSION, and SQLITE_ENABLE_FTS5 (required by the FTS5 indexes).
     const sqlite_c = b.path(b.fmt("{s}/sqlite3.c", .{vendor_dir}));
     const sqlite_flags = &[_][]const u8{
         "-DSQLITE_THREADSAFE=1",
@@ -372,46 +267,31 @@ pub fn build(b: *std.Build) void {
     switch (target.result.os.tag) {
         .linux => {
             if (sys.use_system_sqlite3 and !sqlite_vendor) {
-                // System sqlite3 — link the shared lib. Don't compile
-                // the amalgamation (saves ~3 min on first build +
-                // ~10 MB of build artifacts).
+                // System sqlite3: link the shared lib instead of compiling the
+                // amalgamation (saves ~3 min on a first build + ~10 MB of artifacts).
                 mod.linkSystemLibrary("sqlite3", .{});
             } else {
-                // Vendored amalgamation. Compile the .c into every
-                // consumer (Zig caches the resulting object file).
-                // (Also taken when -Dsqlite-vendor=true even though the
-                // probe found system sqlite3 — the top-level vendor
-                // include above only covers probe-false, so add it here.)
+                // Vendored amalgamation (also via -Dsqlite-vendor): compile sqlite3.c here and
+                // re-add the vendor include that the probe-true branch above skipped.
                 mod.addIncludePath(b.path(vendor_dir));
                 mod.addCSourceFile(.{ .file = sqlite_c, .flags = sqlite_flags });
             }
-            // libpq — only when the app opted in via -Ddb_used AND
-            // the probe found it. Sqlite-only builds (the default) skip
-            // this entirely: no -lpq link, no postgresql include path,
-            // even though Postgres.zig stays on disk.
+            // libpq only when -Ddb_used opts in AND the probe found it: sqlite-only builds
+            // link no -lpq and add no postgresql include path, though Postgres.zig stays on disk.
             if (enable_postgres and sys.use_system_pq) {
                 mod.linkSystemLibrary("pq", .{});
-                // Add both /usr/include and /usr/include/postgresql
-                // because Debian/Ubuntu put libpq-fe.h in
-                // /usr/include/postgresql while Arch has it directly
-                // in /usr/include. Harmless if the other is missing.
+                // Both paths: Debian/Ubuntu keep libpq-fe.h under /usr/include/postgresql,
+                // Arch directly in /usr/include; harmless when the other is missing.
                 mod.addIncludePath(.{ .cwd_relative = "/usr/include/postgresql" });
             }
-            // OpenSSL — only link when system probe finds them. The
-            // vendored amalgamation is independent of ssl/crypto
-            // (it doesn't pull in TLS), so even if the probe fails for
-            // ssl/crypto, the amalgamation still compiles. But we
-            // still try to link ssl/crypto when available because the
-            // main app's libpq / openssl use depends on them.
+            // ssl/crypto are linked only when probed: the amalgamation pulls in no TLS, but
+            // the app's libpq/openssl use does depend on them.
             if (sys.use_system_ssl) mod.linkSystemLibrary("ssl", .{});
             if (sys.use_system_crypto) mod.linkSystemLibrary("crypto", .{});
         },
         .macos => {
-            // macOS native: prefer the system sqlite3 from Homebrew
-            // (keg-only: formula `sqlite` at /opt/homebrew/opt/sqlite/,
-            // with an /opt/homebrew/opt/sqlite3/ alternate) when the
-            // probe finds it. Otherwise fall back to the vendored
-            // amalgamation (works on every host with a C compiler).
+            // macOS native: prefer brew's keg-only formula `sqlite` (opt/sqlite, with an
+            // opt/sqlite3 alternate) when probed; otherwise vendor the amalgamation.
             if (sys.use_system_sqlite3 and !sqlite_vendor) {
                 mod.linkSystemLibrary("sqlite3", .{});
                 mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/sqlite/lib" });
@@ -421,12 +301,8 @@ pub fn build(b: *std.Build) void {
                 mod.addIncludePath(b.path(vendor_dir));
                 mod.addCSourceFile(.{ .file = sqlite_c, .flags = sqlite_flags });
             }
-            // libpq — only when the app opted in via -Ddb_used AND the
-            // probe found brew libpq (keg-only at
-            // /opt/homebrew/opt/libpq/). Same gate as the Linux branch.
-            // (openssl/ssl/crypto stay unwired here — on macOS those are
-            // owned by kabelweb's libcurl backend, and brew libpq's own
-            // dylib carries absolute LC_LOAD paths to brew openssl.)
+            // libpq only when -Ddb_used opts in AND the probe found brew's keg-only libpq;
+            // ssl/crypto stay unwired — brew libpq carries absolute paths, kabelweb owns TLS.
             if (enable_postgres and sys.use_system_pq) {
                 mod.linkSystemLibrary("pq", .{});
                 mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/libpq/lib" });
@@ -434,34 +310,15 @@ pub fn build(b: *std.Build) void {
             }
         },
         .windows => {
-            // Use vcpkg-installed sqlite3 (and libpq/openssl) when the
-            // probe finds them. The CI installs them via
-            // `vcpkg install --recurse <port>:x64-windows` at
-            // `C:/vcpkg/installed/x64-windows/`. This skips the
-            // vendored-amalgamation path entirely — the build no
-            // longer needs to fetch / compile sqlite3.c (saves ~30s on
-            // fresh checkouts). Falls back to vendored on hosts that
-            // don't have vcpkg installed (a developer building on
-            // Windows without vcpkg still gets a working build).
-            //
-            // Use addObjectFile (not linkSystemLibrary) to bypass
-            // the GNU-vs-MSVC lib-name convention mismatch: the
-            // build target is `x86_64-windows-gnu` (GNU toolchain
-            // conventions — `libfoo.a`), but vcpkg ships
-            // `libfoo.lib` / `sqlite3.lib` (MSVC-style extension
-            // with GNU-style name). Explicit object-file links work
-            // with either naming — the linker doesn't try to
-            // translate `-lfoo` → `libfoo.{a,lib}` it just adds
-            // the file the build.zig hands it.
+            // vcpkg libs when probed (CI path `C:/vcpkg/installed/x64-windows/`), else vendored.
+            // addObjectFile, not linkSystemLibrary: vcpkg's MSVC `.lib` names break `-lfoo` here.
             if (sys.use_system_sqlite3) {
                 mod.addIncludePath(.{ .cwd_relative = "C:/vcpkg/installed/x64-windows/include" });
                 if (!sqlite_vendor) {
                     mod.addObjectFile(.{ .cwd_relative = "C:/vcpkg/installed/x64-windows/lib/sqlite3.lib" });
                 } else {
-                    // Stock vcpkg sqlite3 builds lack the fts5 module this
-                    // package requires — compile the amalgamation (with
-                    // FTS5 flags) instead, while still taking libpq/ssl
-                    // from vcpkg below.
+                    // Stock vcpkg sqlite3 lacks the fts5 module this package requires, so
+                    // compile the amalgamation here while still taking libpq/ssl from vcpkg.
                     mod.addIncludePath(b.path(vendor_dir));
                     mod.addCSourceFile(.{ .file = sqlite_c, .flags = sqlite_flags });
                 }
@@ -483,23 +340,16 @@ pub fn build(b: *std.Build) void {
             mod.linkSystemLibrary("bcrypt", .{});
         },
         else => {
-            // Cross-compile to non-Linux/macOS/Windows targets (FreeBSD,
-            // Android, WASI). Same amalgamation path as the named targets;
-            // bcrypt / openssl / pq aren't applicable here.
+            // Other targets (FreeBSD, Android, WASI): same amalgamation path; bcrypt,
+            // openssl and pq do not apply.
             mod.addCSourceFile(.{ .file = sqlite_c, .flags = sqlite_flags });
         },
     }
 
     // === Tests for the package itself ===
-    // `b.addTest({ .root_module = mod })` walks every `_test.zig`
-    // reachable from src/root.zig via the `test { _ = @import(...) }`
-    // block. The mod already carries link_libc + (system or vendored)
-    // sqlite3 amalgamation, so test executables inherit those deps
-    // automatically.
-    // `-Dtest-filter=<substr>` — Zig 0.16 moved test filtering to BUILD
-    // time (`AddTestOptions.filters`); the generated test runner no longer
-    // parses `--test-filter` from its own command line, so
-    // `zig build test -- --test-filter=…` aborts.
+
+    // `b.addTest({ .root_module = mod })` walks every `_test.zig` reachable from src/root.zig;
+    // Zig 0.16 filters tests at BUILD time (`-Dtest-filter=`), the runner's `--test-filter` aborts.
     const test_filter = b.option(
         []const u8,
         "test-filter",
@@ -514,10 +364,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(b.getInstallStep());
 
     // === Benchmark ===
-    // `zig build bench` — deterministic workload over the sqlite backend,
-    // emitting one JSON object on stdout. Built in ReleaseSafe so the
-    // numbers reflect the optimized path without giving up the safety
-    // checks that would turn a silent misbind into a bogus result.
+
+    // `zig build bench`: deterministic sqlite workload emitting one JSON object on stdout,
+    // optimized but with safety checks, so a silent misbind cannot look like a fast run.
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/bench.zig"),
         .target = target,
@@ -534,4 +383,29 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run the deterministic sqlite benchmark");
     bench_step.dependOn(&run_bench.step);
+
+    // The comment-ceiling / catch-unreachable linter (github.com/ginwa123/zglint),
+    // pinned in build.zig.zon; `zig build zginlint:check` is the gate CI runs.
+    const zginlint_dep = b.dependency("zginlint", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zginlint_exe = zginlint_dep.artifact("zginlint");
+    const install_zginlint = b.addInstallArtifact(zginlint_exe, .{});
+    b.step("zginlint", "Build the zginlint CLI into zig-out/bin/zginlint")
+        .dependOn(&install_zginlint.step);
+
+    // The whole gate: the paths it covers, and the comment-block ceiling.
+    // 2 lines is tighter than the tool's own default of 3.
+    const zginlint_scope = [_][]const u8{ "src", "bench", "build.zig" };
+
+    // `has_side_effects` is load-bearing: a Run step is keyed by its binary and argv,
+    // NOT by the tree it reads, so without it a rerun silently skips the scan.
+    const zginlint_check = b.step("zginlint:check", "Enforce the zginlint rules on the tree (zero findings)");
+    const run_zginlint_check = b.addRunArtifact(zginlint_exe);
+    run_zginlint_check.setCwd(b.path("."));
+    run_zginlint_check.addArgs(&.{ "--max-comment-lines", "2" });
+    run_zginlint_check.addArgs(&zginlint_scope);
+    run_zginlint_check.has_side_effects = true;
+    zginlint_check.dependOn(&run_zginlint_check.step);
 }

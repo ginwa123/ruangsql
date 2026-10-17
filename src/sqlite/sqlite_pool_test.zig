@@ -1,40 +1,5 @@
-//! Behavioural tests for READER POOLING — the `Config.read_conns` path.
-//!
-//! WHY A SEPARATE FILE
-//! -------------------
-//! `sqlite_fastpath_test.zig` opens `:memory:`, and `initWithConfig`
-//! deliberately returns early for `:memory:` (`isInMemoryPath`) because
-//! a second connection would see an empty, unrelated database. So EVERY
-//! test in that file — and in `sqlite_test.zig` — runs on the
-//! single-connection path. Reader pooling had no test at all until this
-//! file.
-//!
-//! THE BUGS THESE EXIST FOR
-//! -----------------------
-//! Pooling moved reads off the write connection and onto N extra
-//! connections. Two invariants have to survive that move, and neither
-//! was checked:
-//!
-//!   1. A read must not be able to miss a write that has already
-//!      committed. SQLite keeps at most ONE read transaction open per
-//!      connection, and `query` hands its `Rows` to the caller while
-//!      REUSING the pooled connection for the next request. So one live
-//!      iterator silently pins its connection to the snapshot it opened,
-//!      and every later read that lands on that connection — from any
-//!      thread — sees the old data. With `read_conns = 7` that is one
-//!      request in seven returning stale rows, intermittently, forever.
-//!
-//!   2. A statement handed out by `query` must not be handed out again
-//!      by `exec` / `queryRow` while the caller is still stepping it.
-//!      `SqliteBackend.iterating` guards `query` against `query`, but
-//!      `executeStatement` / `executeQueryRow` call `stmt_cache.acquire`
-//!      with no such check: `acquire` does `sqlite3_reset` +
-//!      `sqlite3_clear_bindings` on the shared `sqlite3_stmt`, i.e. it
-//!      resets the statement the live iterator is mid-way through and
-//!      rebinds it to somebody else's arguments.
-//!
-//! WHY A FILE-BACKED DB: pooling is skipped for `:memory:`, so these
-//! tests are the only ones that exercise it. There is no alternative.
+//! Tests for READER POOLING, the `Config.read_conns` path: `:memory:` skips pooling entirely, so this file is the only one exercising it.
+//! Pins two invariants: a live `Rows` pins its reader's read transaction (later reads on it are stale), and `exec`/`queryRow` must not rebind the statement a live `Rows` is stepping.
 
 const std = @import("std");
 const sqlite = @import("Sqlite.zig");
@@ -98,14 +63,8 @@ fn countOpenFds() usize {
     return n;
 }
 
-// THE FD BUG. A pooled reader is not one descriptor — an open WAL
-// connection holds the database file, its `-wal` and its `-shm`. So an
-// UNLIMITED elastic pool spends `3 x peak concurrent reads` descriptors
-// for the life of the process, and a server that already holds a socket
-// per SSE client runs out. When it does, `sqlite3_open` returns
-// SQLITE_CANTOPEN and the next reader's `PRAGMA journal_mode = WAL` fails
-// with "unable to open database file" — which reads like a permissions
-// problem and is neither.
+// THE FD BUG. A pooled reader is not one descriptor: an open WAL connection holds the database file, its `-wal` and its `-shm`, so an
+// uncapped elastic pool spends `3 x peak concurrent reads` fds for the life of the process — and the failure reads like a permissions problem.
 test "each pooled reader costs FDS_PER_READER descriptors, not one" {
     const builtin = @import("builtin");
     if (builtin.os.tag != .linux) return error.SkipZigTest;
@@ -115,11 +74,8 @@ test "each pooled reader costs FDS_PER_READER descriptors, not one" {
     defer p.deinit();
 
     const before = countOpenFds();
-    // Claim more readers at once than the warm floor, so the pool has to
-    // OPEN new connections rather than reuse idle ones. Then run a real
-    // read on each: a connection holds only the database fd until it
-    // actually touches the WAL, so counting without a query understates
-    // the cost by 2 fds per reader.
+    // Claim more readers at once than the warm floor, so the pool has to OPEN connections rather than reuse idle ones, and run a real read
+    // on each: a connection holds only the database fd until it touches the WAL, so counting without a query understates the cost by 2 fds.
     const extra = 6;
     var held: [6]*SqliteBackend = undefined;
     for (0..extra) |i| {
@@ -140,9 +96,8 @@ test "each pooled reader costs FDS_PER_READER descriptors, not one" {
     try testing.expectEqual(sqlite.FDS_PER_READER * opened, after -| before);
 }
 
-// The hard ceiling that stops it. `max_read_conns = 0` means "no POLICY
-// cap", not "no cap": the pool must still refuse to grow past what the
-// process's `RLIMIT_NOFILE` can fund after reserving headroom.
+// The hard ceiling that stops it. `max_read_conns = 0` means "no POLICY cap", not "no cap": the pool must still refuse to grow past
+// what the process's `RLIMIT_NOFILE` can fund after reserving headroom.
 test "an uncapped pool still stops at the fd-derived ceiling" {
     const cap = sqlite.fdDerivedReaderCap();
     try testing.expect(cap >= 1);
@@ -166,20 +121,11 @@ test "an uncapped pool still stops at the fd-derived ceiling" {
     try testing.expectEqual(@as(usize, 2), p.db.pool.count());
 }
 
-// A read must never FAIL because the pool could not grow. When the pool
-// is out of capacity — fd quota, memory, anything — the read falls back
-// to the primary connection: slower (it serializes) but correct.
-//
-// It also must not give up INSTANTLY. A read that found the pool full used
-// to take the write connection straight away, which is the expensive
-// answer (the write connection carries one mutex and one WAL writer slot,
-// so the read serializes against every write AND holds that mutex for its
-// whole duration). So this asserts the wait happened, and that the
-// fallback is reached only once the budget is spent.
+// A read must never FAIL because the pool could not grow: out of capacity — fd quota, memory, anything — it falls back to the primary
+// connection, slower (it serializes against every write and holds the writer's mutex) but correct, and only once the wait budget is spent.
 test "a read waits for a reader, then falls back to the write connection" {
     const alloc = testing.allocator;
-    // Cap of 1, with that one reader already claimed: the pool cannot
-    // grow. `reader_wait_ms` is small so the budget is observable without
+    // Cap of 1 with that one reader already claimed: the pool cannot grow. `reader_wait_ms` is small so the budget is observable without
     // making the suite wait seconds.
     var p = try Pool.init(.{ .read_conns = 1, .max_read_conns = 1, .reader_wait_ms = 25 });
     defer p.deinit();
@@ -201,16 +147,8 @@ test "a read waits for a reader, then falls back to the write connection" {
     try testing.expect(elapsed >= 15);
 }
 
-// THE REGRESSION THAT PRODUCED THE WARNING STORM. A burst of reads against
-// a full pool used to log
-//
-//     warning: sqlite: reader pool unavailable (PoolExhausted);
-//              serving this read on the write connection
-//
-// once per read, and run every one of them on the write connection. A
-// reader that comes free a few milliseconds later is now worth waiting
-// for, so this read blocks on the pool and is served by the reader the
-// other thread hands back.
+// THE REGRESSION THAT PRODUCED THE WARNING STORM. A burst of reads against a full pool logged "reader pool unavailable (PoolExhausted)"
+// once per read and ran every one on the write connection; a reader that frees a few ms later is worth waiting for, so this read blocks.
 test "a read that finds the pool full waits for a reader instead of taking the write connection" {
     const alloc = testing.allocator;
     var p = try Pool.init(.{ .read_conns = 1, .max_read_conns = 1, .reader_wait_ms = 5_000 });
@@ -225,9 +163,8 @@ test "a read that finds the pool full waits for a reader instead of taking the w
         slot: *SqliteBackend,
 
         fn run(ctx: *@This(), thread_io: std.Io) void {
-            // Long enough that the read is certainly already blocked, so
-            // the wake-up comes from `release`'s signal and not from the
-            // reader having been idle when the read arrived.
+            // Long enough that the read is certainly already blocked, so the wake-up comes from `release`'s signal and not from the reader
+            // having been idle when the read arrived.
             std.Io.sleep(thread_io, .{ .nanoseconds = 60 * std.time.ns_per_ms }, .awake) catch return;
             ctx.db.pool.release(thread_io, ctx.slot);
         }
@@ -240,19 +177,13 @@ test "a read that finds the pool full waits for a reader instead of taking the w
     defer row.deinit(alloc);
     try testing.expectEqualStrings("before", row.values[0]);
 
-    // THE ASSERTION. The value above is worthless as evidence — a read on
-    // the write connection returns the same string, which is exactly why
-    // the bug shipped. What separates the two paths is whether the pool
-    // had to hand this read to the writer.
+    // THE ASSERTION. The value above is worthless as evidence — a read on the write connection returns the same string, which is exactly
+    // why the bug shipped. What separates the two paths is whether the pool had to hand this read to the writer.
     try testing.expectEqual(@as(u64, 0), p.db.readFallbackCount());
 }
 
-// `read_conns` is the warm floor `init` opens eagerly; `max_read_conns` is
-// the ceiling it refuses to grow past. A cap AT OR BELOW the floor makes
-// the two contradict each other, and the damage shows up as a pool that
-// reports itself full while sitting on connections it just opened — every
-// read falling back to the writer, which is the exact symptom this file's
-// neighbours above exist to prevent.
+// `read_conns` is the warm floor `init` opens eagerly; `max_read_conns` is the ceiling it refuses to grow past. A cap AT OR BELOW the
+// floor starves the pool: it reports itself full while sitting on connections it just opened, so every read falls back to the writer.
 test "a policy cap at or below the warm floor cannot starve the pool" {
     var p = try Pool.init(.{ .read_conns = 4, .max_read_conns = 1 });
     defer p.deinit();
@@ -267,11 +198,8 @@ test "a policy cap at or below the warm floor cannot starve the pool" {
     try testing.expectEqual(@as(usize, 4), p.db.pool.idleCount());
 }
 
-// `release` is reached from `Rows.deinit`, which a caller can reach twice
-// (a `Rows` copied by value, a retry that deinits the error path as well).
-// Two `idle` entries for one connection means the next two `claim`s hand
-// out the SAME sqlite handle, and one read ends up stepping a statement
-// another read owns — which the reaper would then close underneath it.
+// `release` is reached from `Rows.deinit`, which a caller can reach twice (a `Rows` copied by value, a retry that deinits the error
+// path too). Two `idle` entries for one connection make the next two `claim`s hand out the SAME sqlite handle — one read steps another's statement.
 test "a repeated release cannot duplicate one connection into the idle list" {
     var p = try Pool.init(.{ .read_conns = 1, .max_read_conns = 1 });
     defer p.deinit();
@@ -290,12 +218,8 @@ test "a repeated release cannot duplicate one connection into the idle list" {
     p.db.pool.release(io, again);
 }
 
-// Positive control: pooling must not break the basic write→read path.
-//
-// `read_conns = 1` keeps this deterministic — the single reader is the
-// only place a read can land. Without this test the staleness test below
-// could pass vacuously (e.g. if routing were broken in a way that made
-// every read fail).
+// Positive control: pooling must not break the basic write→read path. `read_conns = 1` keeps it deterministic — the single reader is
+// the only place a read can land — so the staleness tests below cannot pass vacuously (e.g. if routing made every read fail).
 test "control: a committed write is visible to the next pooled read" {
     const alloc = testing.allocator;
     var p = try Pool.init(.{ .read_conns = 1 });
@@ -311,22 +235,15 @@ test "control: a committed write is visible to the next pooled read" {
     try testing.expectEqualStrings("after", row.values[0]);
 }
 
-// THE BUG. A `Rows` that is still open pins its connection's read
-// transaction, and every LATER read that lands on that connection sees
-// the pinned snapshot instead of committed data.
-//
-// This is not a leak in the caller — `rows` is deinited at the end of
-// this test. The damage is done while it is open, because `query`
-// releases the connection's mutex before the caller has finished
-// stepping, so the connection goes straight back into the pool.
+// THE BUG. A `Rows` still open pins its connection's read transaction, and every LATER read that lands on that connection sees the
+// pinned snapshot instead of committed data — not a caller leak: `query` releases the mutex before the caller has finished stepping.
 test "a live Rows pins its connection's snapshot; later reads on it are stale" {
     const alloc = testing.allocator;
     var p = try Pool.init(.{ .read_conns = 1 });
     defer p.deinit();
 
-    // Open an iterator and read one row. This takes reader-1's read
-    // transaction and leaves it OPEN — `query` handed the statement back
-    // to us and released the mutex.
+    // Open an iterator and read one row: this takes reader-1's read transaction and leaves it OPEN, because `query` handed the statement
+    // back to us and released the mutex.
     var rows = try p.db.query(alloc, "SELECT v FROM t WHERE id = ?", &.{"1"});
     defer rows.deinit();
     {
@@ -339,8 +256,7 @@ test "a live Rows pins its connection's snapshot; later reads on it are stale" {
     // every other connection can see it.
     try p.db.exec(alloc, "UPDATE t SET v = 'after' WHERE id = ?", &.{"1"});
 
-    // A DIFFERENT request reads. It round-robins onto reader-1 — the same
-    // connection the live iterator above still holds open — and is
+    // A DIFFERENT request reads. It round-robins onto reader-1 — the connection the live iterator above still holds open — and is
     // therefore served from the pinned snapshot.
     var rows2 = try p.db.query(alloc, "SELECT v FROM t WHERE id = ?", &.{"1"});
     defer rows2.deinit();
@@ -350,21 +266,8 @@ test "a live Rows pins its connection's snapshot; later reads on it are stale" {
     try testing.expectEqualStrings("after", row2.values[0]);
 }
 
-// THE BUG. `exec` / `queryRow` do not check `SqliteBackend.iterating`,
-// so `stmt_cache.acquire` resets and rebinds the cached statement that a
-// live `Rows` is still stepping, on the ONE connection they share.
-//
-// `acquire` runs `sqlite3_reset` + `sqlite3_clear_bindings` and then binds
-// the caller's own arguments to the SAME `sqlite3_stmt`, so without the
-// `iterating` guard the live iterator's remaining rows are destroyed and
-// its parameters are silently replaced.
-//
-// `read_conns = 0` is the point of this test. With pooling ON, `query`
-// gives its reader to the `Rows` EXCLUSIVELY, so `queryRow` can never land
-// on the same connection and the collision is impossible by construction.
-// The primary connection is still shared — by `query` / `exec` /
-// `queryRow` whenever pooling is off (`:memory:`) or the SQL needs the
-// writer's connection state — so the guard has to hold there.
+// rebinds the shared `sqlite3_stmt` a live `Rows` is mid-way through — its remaining rows and its parameters are destroyed. `read_conns = 0`
+// forces that one shared primary connection (as `:memory:` and writer-state SQL do), which is exactly where the guard has to hold.
 test "queryRow does not steal the statement a live Rows is stepping" {
     const alloc = testing.allocator;
     var p = try Pool.init(.{ .read_conns = 0 });
@@ -395,9 +298,8 @@ test "queryRow does not steal the statement a live Rows is stepping" {
     try testing.expectEqualStrings("second", row.values[0]);
 }
 
-// Two iterators live at the same time, each with DIFFERENT bind values for
-// the same SQL text. Each must see its own row: the pool gives each read
-// its own connection, so neither can reset the other's statement.
+// Two iterators live at the same time, each with DIFFERENT bind values for the same SQL text, must each see its own row: the pool
+// gives each read its own connection, so neither can reset the other's statement.
 test "two live iterators of the same SQL do not interfere" {
     const alloc = testing.allocator;
     var p = try Pool.init(.{ .read_conns = 1 });
@@ -424,17 +326,15 @@ test "two live iterators of the same SQL do not interfere" {
     try testing.expect((try rows2.next()) == null);
 }
 
-// The reader returned to the pool must start a FRESH read — that is the
-// whole reason `Rows.deinit` resets before releasing. Sequential reads on
-// the same reused reader must each see the latest committed data.
+// The reader returned to the pool must start a FRESH read — the whole reason `Rows.deinit` resets before releasing — so sequential
+// reads on the same reused reader each see the latest committed data.
 test "a reused reader starts a fresh read, not the previous snapshot" {
     const alloc = testing.allocator;
     var p = try Pool.init(.{ .read_conns = 1 });
     defer p.deinit();
 
     const sql = "SELECT v FROM t WHERE id = ?";
-    // One buffer for the expected value, rewritten each round. It must
-    // outlive the comparison, which a per-round allocation freed by a
+    // One buffer for the expected value, rewritten each round: it must outlive the comparison, which a per-round allocation freed by a
     // `defer` would not.
     var want_buf: [16]u8 = @splat(0);
     var want: []const u8 = "before";
@@ -451,8 +351,7 @@ test "a reused reader starts a fresh read, not the previous snapshot" {
         want = try std.fmt.bufPrint(&want_buf, "v{d}", .{round});
         try p.db.exec(alloc, "UPDATE t SET v = ? WHERE id = ?", &.{ want, "1" });
 
-        // Read AFTER the write, on whatever reader the pool hands back. A
-        // reader reused while its predecessor's transaction was still open
+        // Read AFTER the write, on whatever reader the pool hands back: a reader reused while its predecessor's transaction was still open
         // would report the PREVIOUS value.
         var rows2 = try p.db.query(alloc, sql, &.{"1"});
         defer rows2.deinit();
@@ -471,23 +370,16 @@ test "pooling is really on: reads land on connections other than the writer" {
 
     try testing.expectEqual(@as(usize, 3), p.db.pool.count());
 
-    // `last_insert_rowid()` is connection state, so it must be answered by
-    // the connection that inserted. If reads were mis-routed onto a
-    // reader, the writer's own rowid would be lost.
-    //
-    // It is the implicit ROWID, not the TEXT `id`: this pool inserted '1'
-    // then '9', so the rowid is 2.
+    // `last_insert_rowid()` is connection state, so it must be answered by the connection that inserted; a read mis-routed onto a reader
+    // would lose the writer's rowid. It is the implicit ROWID, not the TEXT `id` — '1' then '9' were inserted, so this is 2.
     try p.db.exec(alloc, "INSERT INTO t (id, v) VALUES ('9', 'nine')", &.{});
     var id_row = try p.db.queryRow(alloc, "SELECT last_insert_rowid()", &.{});
     defer id_row.deinit(alloc);
     try testing.expectEqualStrings("2", id_row.values[0]);
 }
 
-// THE SHRINK. The pool used to grow without bound: `claim` opened new
-// readers under burst load, `release` only requeued them, and `closeAll`
-// ran solely at shutdown. A burst of 75 concurrent reads left 75 readers
-// (150 fds) open for the life of the process. Idle readers past
-// `max_idle_time_ms` must be closed, down to the `read_conns` floor.
+// THE SHRINK. `claim` opens readers under burst load and `release` only requeues them, so without this a burst of 75 concurrent reads
+// leaves 75 readers (150 fds) open for the life of the process. Idle readers past `max_idle_time_ms` must close to the `read_conns` floor.
 test "pool shrinks to floor after idle timeout" {
     const alloc = testing.allocator;
     var p = try Pool.init(.{ .read_conns = 1, .max_idle_time_ms = 50 });
@@ -503,9 +395,8 @@ test "pool shrinks to floor after idle timeout" {
     p.db.pool.reapIdle(testing.io);
     try testing.expectEqual(@as(usize, 4), p.db.pool.count());
 
-    // Past the timeout, one daemon tick reaps everything above the floor.
-    // This also exercises the swapRemove index fixup: reaping a non-last
-    // slot moves the last slot into the gap and rewrites idle entries.
+    // Past the timeout, one daemon tick reaps everything above the floor. This also exercises the swapRemove index fixup: reaping a
+    // non-last slot moves the last slot into the gap and rewrites idle entries.
     std.Io.sleep(testing.io, .{ .nanoseconds = 150 * std.time.ns_per_ms }, .awake) catch {};
     p.db.pool.reapIdle(testing.io);
     try testing.expectEqual(@as(usize, 1), p.db.pool.count());
@@ -516,15 +407,8 @@ test "pool shrinks to floor after idle timeout" {
     try testing.expectEqualStrings("before", row.values[0]);
 }
 
-// THE INTERVAL. `reapIdleThrottled` is the daemon tick a long-lived server
-// calls on a cadence of its own, and the pool decides whether the work is
-// due. Without it a tick that fires more often than the age it enforces
-// just re-scans an idle list that cannot have changed.
-//
-// NOTE the setup: the burst's own `release` calls already run an inline
-// pass, which consumes the interval. So the first assertion is that a tick
-// arriving right after a burst is throttled — the pool just reaped, and
-// re-scanning immediately would be wasted work.
+// THE INTERVAL. `reapIdleThrottled` is the daemon tick a long-lived server calls on a cadence of its own, and the pool decides
+// whether the work is due. The burst's own `release` calls already run an inline pass, so a tick right after a burst must be throttled.
 test "reapIdleThrottled skips the pass when one ran inside reap_interval_ms" {
     var p = try Pool.init(.{ .read_conns = 1, .max_idle_time_ms = 20, .reap_interval_ms = 10_000 });
     defer p.deinit();
@@ -536,9 +420,8 @@ test "reapIdleThrottled skips the pass when one ran inside reap_interval_ms" {
     for (held) |slot| p.db.pool.release(testing.io, slot);
     try testing.expectEqual(@as(usize, 4), p.db.pool.count());
 
-    // Outlive the idle age: the readers are now old enough to reap, but the
-    // last pass was moments ago and the interval is 10 s, so the tick must
-    // be a no-op. Without the throttle the pool would shrink on every tick.
+    // Outlive the idle age: the readers are now old enough to reap, but the last pass was moments ago and the interval is 10 s, so the
+    // tick must be a no-op. Without the throttle the pool would shrink on every tick.
     std.Io.sleep(testing.io, .{ .nanoseconds = 60 * std.time.ns_per_ms }, .awake) catch {};
     p.db.pool.reapIdleThrottled(testing.io);
     try testing.expectEqual(@as(usize, 4), p.db.pool.count());
@@ -548,9 +431,8 @@ test "reapIdleThrottled skips the pass when one ran inside reap_interval_ms" {
     try testing.expectEqual(@as(usize, 1), p.db.pool.count());
 }
 
-// 0 means "derive it from max_idle_time_ms", which is what every consumer
-// got before the knob existed. A consumer that never sets it must not see a
-// behaviour change: the derived interval is max(20/4, 1000) = 1 s.
+// 0 means "derive it from max_idle_time_ms", which is what every consumer got before the knob existed: the derived interval is
+// max(20/4, 1000) = 1 s, so a consumer that never sets it sees no behaviour change.
 test "reap_interval_ms 0 derives the interval from max_idle_time_ms" {
     var p = try Pool.init(.{ .read_conns = 1, .max_idle_time_ms = 20, .reap_interval_ms = 0 });
     defer p.deinit();
@@ -570,9 +452,8 @@ test "reap_interval_ms 0 derives the interval from max_idle_time_ms" {
     try testing.expectEqual(@as(usize, 1), p.db.pool.count());
 }
 
-// The floor is the invariant that survives every other change: a pool may
-// shrink, but never below `read_conns`, or the next burst pays to reopen
-// connections the boot already paid for.
+// The floor is the invariant that survives every other change: a pool may shrink, but never below `read_conns`, or the next burst
+// pays to reopen connections the boot already paid for.
 test "a throttled reap still stops at the warm floor" {
     var p = try Pool.init(.{ .read_conns = 2, .max_idle_time_ms = 20, .reap_interval_ms = 0 });
     defer p.deinit();
@@ -591,9 +472,8 @@ test "a throttled reap still stops at the warm floor" {
     try testing.expectEqualStrings("before", row.values[0]);
 }
 
-// A CLAIMED reader is never reaped, however idle the rest of the pool is.
-// Reaping only scans the idle list; the live connection must survive and
-// stay usable, and the pool must still converge to the floor afterwards.
+// A CLAIMED reader is never reaped, however idle the rest of the pool is: reaping only scans the idle list, so the live connection
+// must survive and stay usable, and the pool must still converge to the floor afterwards.
 test "claimed slots never reaped" {
     const alloc = testing.allocator;
     var p = try Pool.init(.{ .read_conns = 1, .max_idle_time_ms = 0 });
@@ -621,12 +501,8 @@ test "claimed slots never reaped" {
     try testing.expectEqual(@as(usize, 1), p.db.pool.count());
 }
 
-// THE LEAK CANARY. A `Rows` owns its pooled reader until `deinit`, and
-// draining it with `next()` does NOT return it. Nothing else notices when a
-// caller forgets: the row bytes belong to the caller's allocator, the reader
-// belongs to the pool, so `testing.allocator` reports a clean run while a
-// sqlite connection stays checked out for the life of the process. This is
-// the one signal that does notice.
+// THE LEAK CANARY. A `Rows` owns its pooled reader until `deinit`, and draining it with `next()` does NOT return it; nothing else
+// notices a forgotten one, because the row bytes belong to the caller's allocator while the connection belongs to the pool.
 test "a deinited Rows returns its reader; a drained one does not" {
     const alloc = testing.allocator;
     var p = try Pool.init(.{ .read_conns = 1 });
@@ -660,9 +536,8 @@ test "a deinited Rows returns its reader; a drained one does not" {
     try testing.expectEqual(@as(usize, 0), p.db.outstandingClaims());
 }
 
-// A reaping pass must never orphan a slot: a slot that leaves `slots` is a
-// connection nothing can reach or ever close, and it still counts against
-// the cap. Every reader ends up back in the idle list.
+// A reaping pass must never orphan a slot: a slot that leaves `slots` is a connection nothing can reach or ever close, and it still
+// counts against the cap. Every reader ends up back in the idle list.
 test "reaping leaves no slot unreachable" {
     const alloc = testing.allocator;
     var p = try Pool.init(.{ .read_conns = 2, .max_idle_time_ms = 0 });
@@ -678,9 +553,8 @@ test "reaping leaves no slot unreachable" {
     // `max_idle_time_ms = 0` reaps on every pass, down to the warm floor.
     for (0..4) |_| p.db.pool.reapIdle(io);
 
-    // Every slot is either idle or claimed — there is no third state. If a
-    // reaping pass dropped an entry without closing its slot, the counts
-    // would not add up and the difference would be leaked connections.
+    // Every slot is either idle or claimed — there is no third state. A reaping pass that dropped an entry without closing its slot
+    // would leave the counts short, and the difference would be leaked connections.
     try testing.expectEqual(
         p.db.pool.count(),
         p.db.pool.idleCount() + p.db.outstandingClaims(),
@@ -693,10 +567,8 @@ test "reaping leaves no slot unreachable" {
     try testing.expectEqual(@as(usize, 0), p.db.outstandingClaims());
 }
 
-/// Allocator that records whether it was asked for anything, and can be told
-/// to fail. Pass one to observe WHERE a backend allocates, which is the only
-/// way to check a knob like `Config.allocator` — reading the field back
-/// proves nothing, because a field can be honoured by nothing.
+/// Allocator that records whether it was asked for anything, and can be told to fail: the only way to observe WHERE a backend
+/// allocates, since reading a knob like `Config.allocator` back proves nothing — a field can be honoured by nothing.
 const Spy = struct {
     child: std.mem.Allocator,
     allocs: usize = 0,
@@ -735,10 +607,8 @@ const Spy = struct {
     }
 };
 
-// `Config.allocator` exists because the pool's memory was invisible to the
-// caller. This asserts the invisibility is gone: the pool's connections, its
-// index lists, and each connection's statement cache are allocated through
-// the supplied allocator rather than through `smp_allocator`.
+// `Config.allocator` exists because the pool's memory was invisible to the caller. This asserts the invisibility is gone: the pool's
+// connections, its index lists and each connection's statement cache are allocated through the supplied allocator, not `smp_allocator`.
 test "the pool allocates through the configured allocator" {
     const alloc = testing.allocator;
     var spy: Spy = .{ .child = alloc };
@@ -760,19 +630,14 @@ test "the pool allocates through the configured allocator" {
     defer db.deinit();
     try db.initWithConfig(io, path, .{ .read_conns = 2, .allocator = spy.allocator() });
 
-    // The warm floor alone is enough to prove the plumbing: opening two
-    // readers allocates two connections plus the pool's two index lists, and
-    // none of that may come from the global.
+    // The warm floor alone is enough to prove the plumbing: opening two readers allocates two connections plus the pool's two index
+    // lists, and none of that may come from the global.
     try testing.expectEqual(@as(usize, 2), db.pool.count());
     try testing.expect(spy.allocs >= 4);
     try testing.expectEqual(@as(usize, 0), spy.frees);
 
-    // A read caches its statement, which is the OTHER allocation a pooled
-    // connection makes and the one most likely to be missed by a partial fix.
-    // Asserted on the ALLOCATOR rather than on `stmt_cache.count()`: the read
-    // is served by a pooled reader, so its cache is the reader's, not the
-    // primary's — and "did the supplied allocator see it" is the property
-    // under test anyway, not "which connection cached it".
+    // A read caches its statement — the OTHER allocation a pooled connection makes, and the one a partial fix is likeliest to miss —
+    // asserted on the ALLOCATOR rather than `stmt_cache.count()`, since that cache belongs to the pooled reader, not to the primary.
     const before_read = spy.allocs;
     var row = try db.queryRow(alloc, "SELECT 1", &.{});
     defer row.deinit(alloc);
@@ -783,9 +648,8 @@ test "the pool allocates through the configured allocator" {
     try testing.expectEqual(spy.allocs, spy.frees);
 }
 
-// The default must stay the global, so existing call sites keep their
-// behaviour. `null` is not an error and not a silent switch to the caller's
-// per-query allocator: that allocator is row-lifetime and the pool is not.
+// The default must stay the global, so existing call sites keep their behaviour: `null` is not an error and not a silent switch to
+// the caller's per-query allocator, which is row-lifetime while the pool is not.
 test "no configured allocator still works, on the global" {
     const alloc = testing.allocator;
     var p = try Pool.init(.{ .read_conns = 1 });
@@ -797,18 +661,8 @@ test "no configured allocator still works, on the global" {
     try testing.expectEqual(@as(usize, 0), p.db.outstandingClaims());
 }
 
-// The RULE behind `fdDerivedReaderCap`, asserted for budgets THIS process
-// does not have — because the one that matters is macOS's.
-//
-// macOS hands a process a soft `RLIMIT_NOFILE` of 256, which IS
-// `FD_HEADROOM`. The un-scaled rule (`(soft - FD_HEADROOM) / 2`, floored at
-// 1) therefore returned a ceiling of 1: the elastic pool could never open a
-// second reader, and every read that found the single reader busy waited out
-// the whole `reader_wait_ms` budget (5 s) before falling back to the write
-// connection. The same call gave a Linux launcher (soft 1024) 384 readers,
-// so identical code was ~4000x slower on one platform with no configuration
-// difference. No Linux CI runner can hand the test process a 256 soft limit,
-// which is exactly why the rule is a pure function of the budget.
+// The RULE behind `fdDerivedReaderCap`, asserted for budgets THIS process does not have — a pure function of the budget, because no CI
+// runner can hand the test a 256 soft limit. macOS ships 256, which IS `FD_HEADROOM`: un-scaled, the cap floored at 1 and no second reader opened.
 test "reader cap: macOS's 256-descriptor budget still funds a reader pool" {
     // The regression, tied to the number macOS actually ships.
     try testing.expectEqual(@as(usize, 64), sqlite.readerCapForSoftLimit(256));
@@ -826,9 +680,8 @@ test "reader cap: macOS's 256-descriptor budget still funds a reader pool" {
 }
 
 test "reader cap: the scaled reserve never spends what the process does not have" {
-    // Below the full reserve the pool may spend at most HALF the budget —
-    // the other half is what is left for sockets, SSE clients and subprocess
-    // pipes, which is the whole reason `FD_HEADROOM` exists.
+    // Below the full reserve the pool may spend at most HALF the budget — the other half is what is left for sockets, SSE clients and
+    // subprocess pipes, which is the whole reason `FD_HEADROOM` exists.
     var soft: usize = 4;
     while (soft <= sqlite.FD_HEADROOM) : (soft += 1) {
         const cap = sqlite.readerCapForSoftLimit(soft);

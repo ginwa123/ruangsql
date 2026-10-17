@@ -143,3 +143,25 @@ jobs:
         run: zig build test "-Ddb_used=sqlite,postgres"
         env:
           POSTGRES_TEST_CONNINFO: "host=localhost port=5432 user=postgres password=postgres dbname=postgres connect_timeout=10"
+
+  zginlint:
+    # The comment-block + catch-unreachable linter (github.com/ginwa123/zglint),
+    # pinned by URL + hash in build.zig.zon and run over this tree with a
+    # 2-line comment ceiling and zero tolerance: no baseline, no suppression.
+    name: zginlint (comment-block ceiling, zero findings)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # Nothing here compiles the sqlite amalgamation or links libpq:
+      # `zginlint:check` builds the linter (a std-only binary) and walks
+      # the tree, so no system deps and no vendored download are needed.
+      - name: Zig lint (zginlint, zero findings)
+        run: zig build zginlint:check

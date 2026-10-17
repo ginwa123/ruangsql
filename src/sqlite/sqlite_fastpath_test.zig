@@ -1,17 +1,5 @@
-//! Tests for the prepared-statement cache that now backs `exec`,
-//! `queryRow` and `Transaction.exec`.
-//!
-//! The whole point of the cache is that it is INVISIBLE: `exec` and
-//! `queryRow` keep their signatures, their semantics, and their ownership
-//! rules. So these tests assert exactly that — the observable behaviour of
-//! the public API is unchanged, including the cases that used to be
-//! per-call `prepare`/`finalize` (error paths, empty SQL, NULL binding,
-//! repeated statements) — plus the leak-freedom the cache introduces
-//! (statement keys are owned; `deinit` must release them).
-//!
-//! Every backend here is created on the leak-checking test allocator, so a
-//! cached statement or its SQL-text key that is never freed fails a test
-//! rather than leaking quietly.
+//! Tests for the statement cache backing `exec`, `queryRow` and `Transaction.exec`: the cache must be INVISIBLE —
+//! signatures, semantics and ownership unchanged — yet it owns the SQL-text keys, so `deinit` must release them.
 
 const std = @import("std");
 const testing = std.testing;
@@ -96,9 +84,8 @@ test "query (Rows iterator) still gives every row, including with the cache in p
     defer teardown(&ctx);
     const alloc = testing.allocator;
 
-    // Iterate the same SELECT twice in a row: `query` prepares its own
-    // statement each time, so a second live iterator must not disturb the
-    // first (which is why iterators are not cached).
+    // Iterate the same SELECT twice in a row: `query` prepares its own statement each time, so a second live
+    // iterator must not disturb the first — which is why iterators are not cached.
     var first = try ctx.db.query(alloc, "SELECT username FROM users ORDER BY id", &.{});
     defer first.deinit();
     const r1 = (try first.next()) orelse return error.ExpectedRow;
@@ -120,17 +107,8 @@ test "query (Rows iterator) still gives every row, including with the cache in p
 // ─── Empty-string binding: reads vs writes ────────────────────────────────
 
 test "reads bind \"\" as an empty STRING, not NULL (the optional-filter idiom)" {
-    // This is the asymmetry that broke a downstream app: `query`/`queryRow`
-    // have always bound an empty slice as an empty STRING, and callers use
-    // that for optional filters —
-    //
-    //     SELECT id FROM t WHERE (? = '' OR id = ?)
-    //
-    // with the unused filter passed as "". If "" were bound as NULL then
-    // `NULL = ''` is NULL, the WHERE clause is NULL for every row, and the
-    // query returns NOTHING instead of ignoring the filter. `exec` binding
-    // "" as NULL is the (unchanged) write-side convention, so the two must
-    // stay different.
+    // Reads bind "" as an empty STRING (the `WHERE (? = '' OR id = ?)` optional-filter idiom): bound as NULL,
+    // `NULL = ''` is NULL and every row is filtered out — the query returns NOTHING. `exec` binds "" as NULL instead.
     var ctx = try setupSeeded();
     defer teardown(&ctx);
     const alloc = testing.allocator;
@@ -185,9 +163,8 @@ test "exec still binds \"\" as NULL (the write-side convention)" {
 }
 
 test "one SQL text serves both a read and a write with their own bind rules" {
-    // `exec` and `queryRow` share the statement cache by SQL text, but the
-    // bind rule is chosen per CALL, not per statement — so the same text
-    // must not leak one path's binding into the other's.
+    // `exec` and `queryRow` share the cache by SQL text, but the bind rule is chosen per CALL, not per statement —
+    // so the same text must not leak one path's binding into the other's.
     var ctx = try setupSeeded();
     defer teardown(&ctx);
     const alloc = testing.allocator;
@@ -358,9 +335,8 @@ test "deinit finalizes cached statements without leaking (leak-checked allocator
     defer db.deinit();
     try db.init(threaded.io(), ":memory:");
 
-    // Several distinct SQL texts (DDL + DML + SELECT), each run more than
-    // once, so both the cached and the uncached paths are exercised and
-    // everything must still be released by `deinit`.
+    // Several distinct SQL texts (DDL + DML + SELECT), each run more than once, so both the cached and the
+    // uncached paths are exercised and everything must still be released by `deinit`.
     var round: usize = 0;
     while (round < 3) : (round += 1) {
         const id = try std.fmt.allocPrint(alloc, "{d}", .{round + 1});

@@ -1,17 +1,5 @@
-//! Tests for `SqliteBackend.Rows.getLastErrorMessage` — the new
-//! path that surfaces the underlying SQLite error message (e.g.
-//! `"fts5: syntax error"`) to callers instead of the bare
-//! `Error.QueryFailed` enum name. Without this, the user sees
-//! `"FTS search failed: QueryFailed"` in the chat and has no idea
-//! what actually broke.
-//!
-//! Blackbox: each test opens a fresh `:memory:` DB, sets up an FTS5
-//! table, runs a deliberately-bad MATCH query, and asserts that
-//! `rows.getLastErrorMessage()` returns a non-empty, useful string.
-//!
-//! These tests are RED before the implementation lands — they call
-//! `rows.getLastErrorMessage()`, which doesn't exist yet. They're
-//! GREEN after `Rows.last_error_msg` is added.
+//! Tests for `SqliteBackend.Rows.getLastErrorMessage`, which surfaces the raw SQLite message (e.g. `"fts5:
+//! syntax error"`) instead of the bare `Error.QueryFailed`. Blackbox: fresh `:memory:`, FTS5 table, bad MATCH.
 
 const std = @import("std");
 const testing = std.testing;
@@ -42,9 +30,8 @@ fn teardown(ctx: *DbCtx) void {
 // ─── Group 1: FTS5 syntax error capture ─────────────────────────────────
 
 test "Rows: getLastErrorMessage returns non-empty text after FTS5 syntax error (a -)" {
-    // FTS5 parses the MATCH query string. `a -` (binary NOT with no
-    // right operand) is a syntax error — sqlite3_step returns an
-    // error. Before the fix, callers only saw `Error.QueryFailed`.
+    // `a -` (binary NOT with no right operand) is an FTS5 syntax error raised at `sqlite3_step`, which callers
+    // used to see only as `Error.QueryFailed`.
     var ctx = try setupDb();
     defer teardown(&ctx);
     const alloc = testing.allocator;
@@ -63,9 +50,7 @@ test "Rows: getLastErrorMessage returns non-empty text after FTS5 syntax error (
     const next_result = rows.next();
     try testing.expectError(sqlite_mod.Error.QueryFailed, next_result);
 
-    // KEY assertion: getLastErrorMessage() must return a non-empty
-    // string so callers can include it in their formatted error
-    // rather than just `QueryFailed`.
+    // KEY assertion: a non-empty message that is not the bare `QueryFailed`, so callers can put it in their error.
     const sql_msg = rows.getLastErrorMessage() orelse "";
     try testing.expect(sql_msg.len > 0);
     try testing.expect(!std.mem.eql(u8, sql_msg, "QueryFailed"));
@@ -93,9 +78,8 @@ test "Rows: getLastErrorMessage returns null before any error occurs" {
 }
 
 test "Rows: getLastErrorMessage remains valid until deinit, then is null" {
-    // Ownership contract: the returned slice lives until deinit. After
-    // deinit, getLastErrorMessage() must return null (no use-after-free
-    // window where callers could still try to read the message).
+    // Ownership contract: the returned slice lives until `deinit`; after that `getLastErrorMessage()` must return
+    // null, so no use-after-free window is left open for callers holding the message.
     var ctx = try setupDb();
     defer teardown(&ctx);
     const alloc = testing.allocator;
@@ -113,10 +97,6 @@ test "Rows: getLastErrorMessage remains valid until deinit, then is null" {
         try testing.expect(sql_msg != null);
         rows.deinit();
     }
-    // After deinit, getLastErrorMessage would be a use-after-free.
-    // The contract is: null after deinit. We can't call deinit twice
-    // here (the test ctx teardown closes the db), so we just check
-    // the lifecycle contract by reading the message before deinit
-    // and ensuring it was non-null. The leak-detector in
-    // std.testing.allocator catches any buffer we forgot to free.
+    // After `deinit`, `getLastErrorMessage()` would be a use-after-free. `deinit` cannot be called twice here (the
+    // ctx teardown closes the db), so the message is read before it and asserted non-null; the leak detector covers frees.
 }

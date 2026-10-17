@@ -1,16 +1,5 @@
-//! Tests for the test helpers themselves. These are NOT required for
-//! the production code — they verify the helper API works as
-//! documented, so a future refactor of `test_helpers.zig` can't
-//! silently break the public surface used by `postgres_test.zig`
-//! and any future test that wants an isolated PostgreSQL DB.
-//!
-//! The tests use the helpers exactly as a downstream test would:
-//!   - `getOrStartTestInstance` to probe the shared instance
-//!   - `createTempDb` to provision an isolated DB
-//!   - `dropTempDb` to clean up
-//!
-//! All tests gate on `is_available` so this file skips cleanly on
-//! hosts without a running PG instance (e.g. CI without libpq).
+//! Tests for the helper API surface in `test_helpers.zig` that `postgres_test.zig`
+//! depends on; every test gates on `is_available` and skips without a live PG instance.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -24,9 +13,8 @@ test "getOrStartTestInstance returns a usable TestEnv on a live instance" {
 
     if (!env.is_available) return; // skip silently if no PG
 
-    // The conninfo is non-empty and NUL-terminated (libpq requires
-    // the C string to have a NUL). For a [:0] slice the sentinel lives
-    // at index len (len itself excludes it).
+    // libpq needs a NUL-terminated C string: for a `[:0]` slice the sentinel lives at
+    // index `len`, which itself excludes it.
     try testing.expect(env.conninfo.len > 0);
     try testing.expect(env.conninfo[env.conninfo.len] == 0);
 }
@@ -77,9 +65,8 @@ test "createTempDb is isolated: two calls produce independent DBs" {
     // Different DB names.
     try testing.expect(!std.mem.eql(u8, ctx1.db_name, ctx2.db_name));
 
-    // ctx1 and ctx2 have different connections (different PGconn
-    // pointers). We don't dereference the pointers (they're opaque),
-    // but the addresses should differ.
+    // The two contexts hold different (opaque) PGconn pointers — we compare the
+    // addresses, never dereference them.
     try testing.expect(@intFromPtr(ctx1.db.conn) != @intFromPtr(ctx2.db.conn));
 
     // ctx1 can create a table without affecting ctx2.
@@ -102,9 +89,8 @@ test "createTempDb: failure on bad base conninfo returns error" {
     const env = helpers.getOrStartTestInstance(alloc);
     if (!env.is_available) return;
 
-    // Use an obviously bad port with a short connect_timeout. The
-    // CREATE DATABASE step will fail at PQconnectdb and return
-    // DatabaseNotFound.
+    // The bad port plus a short connect_timeout makes the CREATE DATABASE step
+    // fail at PQconnectdb with DatabaseNotFound.
     const result = helpers.createTempDb(alloc,
         "host=/tmp port=1 user=ginwa dbname=postgres connect_timeout=1");
     try testing.expectError(helpers.PostgresError.DatabaseNotFound, result);
@@ -194,9 +180,8 @@ test "createDatabase: standalone helper creates a database on the shared instanc
         .{ pid_bits, counter_value });
     defer alloc.free(db_name);
 
-    // Use the standalone helper — NOT createTempDb. Always drop on
-    // ANY exit path so this test never leaves a stray database on the
-    // shared instance — even if an early assertion fails.
+    // Use `createDatabase`/`dropDatabase` (not `createTempDb`) and always drop on any
+    // exit path, so an early assertion failure can't leave a stray database behind.
     try helpers.createDatabase(alloc, env.conninfo, db_name);
     defer helpers.dropDatabase(alloc, env.conninfo, db_name);
 
@@ -241,15 +226,13 @@ test "dropDatabase: standalone helper drops a database (no TestDb needed)" {
         .{ pid_bits, counter_value });
     defer alloc.free(db_name);
 
-    // Create via standalone helper, drop via standalone helper — no
-    // PostgresBackend opened. Use errdefer so a failure between
-    // create and drop never leaves a stray database.
+    // Standalone helper create + drop, no PostgresBackend opened; the drop is deferred
+    // so a failure between the two never leaves a stray database.
     try helpers.createDatabase(alloc, env.conninfo, db_name);
     defer helpers.dropDatabase(alloc, env.conninfo, db_name);
 
-    // Drop NOW, then verify it's gone. (The defer above stays as a
-    // safety net for failures between create and drop — dropping a
-    // missing database is non-fatal via IF EXISTS.)
+    // Drop now, then verify; the defer above stays as a safety net, and dropping a
+    // missing database is non-fatal via IF EXISTS.
     helpers.dropDatabase(alloc, env.conninfo, db_name);
 
     // Verify it's gone.
@@ -293,28 +276,9 @@ test "dropDatabase: non-fatal on bad admin conninfo" {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  LEAK-PREVENTION TESTS — the three that matter for production confidence
-// ═══════════════════════════════════════════════════════════════════════════
-//
-// These tests verify the cleanup guarantees promised in `test_helpers.zig`:
-//
-//   1. **Concurrent execution** — multiple OS threads calling
-//      `createTempDb` / `dropTempDb` at the same time must NOT crash
-//      and must produce distinct, fully-cleaned databases. Exercises
-//      the thread-safe `getOrStartTestInstance` and confirms the
-//      atomic counter disambiguates simultaneous calls.
-//   2. **No C-lib fd leaks** — N sequential cycles of
-//      `createTempDb` / `dropTempDb` must not leave file descriptors
-//      behind. Counts `/proc/self/fd/` before & after; expects the
-//      count to be unchanged (within a small tolerance for libpq's
-//      internal caching).
-//   3. **No stray databases** — after a stress run that creates and
-//      drops many databases, `pg_database` must show zero
-//      `nalar_pg_test_*` entries. Catches the bug where a partial
-//      failure (CREATE DATABASE succeeds, `db.init` fails) leaves a
-//      stranded database.
-//
-// All three are gated on `env.is_available` so they skip cleanly on
-// hosts without a running PG instance.
+
+// Concurrent createTempDb/dropTempDb must not crash and must yield distinct databases;
+// after stress runs no fds leak and no `nalar_pg_test_*` row survives in pg_database.
 
 
 test "LEAK: no fd leaks — open+drop fd count is stable across 10 sequential cycles" {
@@ -334,9 +298,8 @@ test "LEAK: no fd leaks — open+drop fd count is stable across 10 sequential cy
 
     const fds_after = countOpenFds();
 
-    // Tolerance: libpq may keep a small per-connection cache that grows
-    // monotonically up to a maximum. We allow +5 fds of drift before
-    // flagging a leak.
+    // libpq keeps a small per-connection cache that grows up to a maximum, so the
+    // check tolerates +5 fds of drift before flagging a leak.
     const drift: isize = @as(isize, @intCast(fds_after)) - @as(isize, @intCast(fds_before));
     if (drift > 5) {
         std.debug.print(
@@ -387,17 +350,8 @@ test "LEAK: no stray databases — pg_database is empty after a stress run" {
     try testing.expectEqual(@as(usize, 0), leaked);
 }
 
-/// Count open file descriptors for the current process via
-/// `/proc/self/fd/`. Used by the fd-leak test to confirm libpq isn't
-/// leaking fds across N `createTempDb`/`dropTempDb` cycles.
-///
-/// Linux-only: `/proc/self/fd` doesn't exist on macOS/Windows, and
-/// `std.c.readdir` isn't even declared there (compile error). The
-/// comptime gate below prunes the POSIX body on non-Linux targets so
-/// the postgres suite still compiles there (its tests self-skip
-/// without a server anyway). Uses libc `opendir`/`readdir` because
-/// the Zig 0.16 std.fs API requires an `Io` runtime which we'd rather
-/// not drag into this helper.
+/// Count this process's open fds via `/proc/self/fd/` for the fd-leak test. Linux-only
+/// and comptime-gated; uses libc `opendir`/`readdir` since Zig 0.16 std.fs needs an `Io`.
 fn countOpenFds() usize {
     if (comptime builtin.os.tag != .linux) return 0;
     const maybe_dir = std.c.opendir("/proc/self/fd");

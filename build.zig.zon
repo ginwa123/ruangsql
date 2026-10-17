@@ -61,6 +61,14 @@
         //    // actually used.
         //    .lazy = false,
         //},
+        // The comment-ceiling / catch-unreachable linter
+        // (github.com/ginwa123/zglint), pinned by URL + hash.
+        // `zig build zginlint:check` is the gate; the tool is std-only.
+        // Move the pin: `zig fetch "git+https://github.com/ginwa123/zglint.git#<sha>"`.
+        .zginlint = .{
+            .url = "git+https://github.com/ginwa123/zglint.git#bd346bb08c07d0cc1c9d261b0ed1cc46586ca889",
+            .hash = "zginlint-0.0.0-0kYHps_-AAAni9TozY89aHgd9j2DX93yo4-4pILsz_P7",
+        },
     },
     // Specifies the set of files and directories that are included in this package.
     // Only files and directories listed here are included in the `hash` that

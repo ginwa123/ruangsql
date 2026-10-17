@@ -1,39 +1,5 @@
-//! PostgreSQL backend for nalar. Provides an interface that mirrors the
-//! SQLite backend in `sqlite/Sqlite.zig` exactly — same public functions
-//! (`init` / `deinit` / `exec` / `queryRow` / `query` / `changes` /
-//! `begin` / `savepoint`), same `Error` variants, same `Row` / `Rows` /
-//! `Transaction` shapes — so call sites can swap `SqliteBackend` for
-//! `PostgresBackend` without rewriting any logic.
-//!
-//! **`?` placeholder translation.** SQLite-style `?` placeholders are
-//! translated to PostgreSQL-style `$N` (1-indexed) before being sent to
-//! the server. The translator preserves `?` inside:
-//!   - single-quoted string literals (`'...'`) with `''` escape
-//!   - double-quoted identifiers (`"..."`) with `""` escape
-//!   - line comments (`-- ...`)
-//!   - block comments (`/* ... */`)
-//!   - dollar-quoted strings (`$tag$...$tag$`, PostgreSQL-specific)
-//!
-//! See `translatePlaceholders` for the full rules.
-//!
-//! **Text-only binding.** Like the SQLite backend, all argument values
-//! are bound as text. Empty `[]const u8` args bind as SQL NULL (project
-//! convention). NUL-terminated copies are allocated per-call because
-//! libpq's `PQexecParams` requires `*[*:0]const u8` for text format and
-//! does not honor `paramLengths` for text input.
-//!
-//! **`changes()` semantics.** `PQcmdTuples(result)` returns the number
-//! of rows affected by the last INSERT/UPDATE/DELETE as a C string
-//! (e.g. `"3"`). This is parsed into `last_changes` after every
-//! successful `exec`. CREATE/SELECT statements yield 0.
-//!
-//! **Connection string.** `init` takes a libpq conninfo string instead
-//! of a SQLite file path. Example: `host=/tmp port=54329 user=ginwa
-//! dbname=mydb`. See <https://www.postgresql.org/docs/current/libpq-connect.html>
-//! for the full keyword/value grammar.
-//!
-//! See `postgres_test.zig` for the canonical documentation of the
-//! public API surface and usage patterns.
+//! PostgreSQL backend for nalar — same public surface and `Error` variants as `sqlite/Sqlite.zig`
+//! so the two stay swappable. `init` takes a libpq conninfo string; `?` args rewrite to `$N`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -51,37 +17,21 @@ pub const Error = error{
     RowNotFound,
     OutOfMemory,
     Canceled,
-    /// Returned by any Transaction method (exec/query/queryRow/commit/
-    /// rollback) called after the transaction has been completed.
-    /// Mirrors the SQLite contract — see `sqlite/Sqlite.zig` for the
-    /// full discussion and recommended defer pattern.
+    /// Returned by any Transaction method called after the transaction has been finalized;
+    /// mirrors the SQLite contract — see `sqlite/Sqlite.zig` for the defer pattern.
     TransactionClosed,
 };
 
-/// Cross-platform libpq bindings.
-///
-/// IMPORTANT: The `c` declarations are scoped INSIDE `PostgresBackend`
-/// (lazily resolved when the struct is referenced) — not at file
-/// level. The reason mirrors `Sqlite.zig`'s rationale: `@cImport` is
-/// header-driven, so hoisting it to file level would force every
-/// translation unit that `@import("Postgres.zig")`s to provide libpq
-/// headers on the include path. Same pattern, same comment.
+/// Cross-platform libpq bindings. `c` lives INSIDE `PostgresBackend` and resolves lazily, so
+/// `@import("Postgres.zig")` never forces libpq headers onto the include path (as in `Sqlite.zig`).
 pub const PostgresBackend = struct {
-    /// libpq C bindings. `pub` so test files and external callers
-    /// can access them (e.g. for the per-test admin connection that
-    /// `CREATE DATABASE`s the test target — see `postgres_test.zig`).
-    /// The `c` is lazily resolved via the `@cImport`/`else` branch
-    /// at the first use of the struct, mirroring `Sqlite.zig`'s
-    /// pattern of scoping the c bindings inside the backend.
+    /// libpq C bindings, `pub` so tests can open the admin connection that `CREATE DATABASE`s the
+    /// target (see `postgres_test.zig`); resolved lazily at first use of the struct.
     pub const c = if (builtin.os.tag == .linux)
         @cImport(@cInclude("libpq-fe.h"))
     else
-        // Manual declarations for macOS/Windows. Mirrors Sqlite.zig's
-        // cross-platform scaffolding — only the function signatures we
-        // actually use are declared here. To compile this on non-Linux
-        // platforms, add the matching macOS Homebrew / Windows vcpkg
-        // paths to build.zig (libpq in /opt/homebrew/opt/libpq or
-        // C:/vcpkg/installed/x64-windows).
+        // Manual declarations for macOS/Windows (only the signatures we use); a non-Linux build must
+        // add libpq's include path in build.zig — /opt/homebrew/opt/libpq or C:/vcpkg/installed/x64-windows.
         struct {
             pub const PGconn = opaque {};
             pub const PGresult = opaque {};
@@ -128,24 +78,14 @@ pub const PostgresBackend = struct {
     io: std.Io = .failing,
     conn: ?*c.PGconn = null,
     mutex: std.Io.Mutex = .init,
-    /// Allocator used for per-call parameter buffers and tiny
-    /// internal SQL strings (e.g. SAVEPOINT/RELEASE/ROLLBACK
-    /// names). Set during `init`. NOT used to allocate the
-    /// `Row` / `Rows` payload — those follow the per-call
-    /// allocator that the caller passes to `exec`/`query`.
-    /// This exists so that `begin`/`savepoint`/`commit` can
-    /// allocate their SQL strings without taking an allocator
-    /// parameter (those entry points don't take one).
+    /// Allocator for param buffers and the begin/savepoint/commit SQL strings (those entry points take
+    /// no allocator). NOT used for the `Row`/`Rows` payload — that follows the caller's per-call allocator.
     alloc: std.mem.Allocator = std.heap.page_allocator,
-    /// Tracks the current transaction nesting depth (0 = no tx active;
-    /// 1 = top-level BEGIN in flight; 2+ = nested SAVEPOINT). Mirrors
-    /// `SqliteBackend.transaction_depth` — see that file for the full
-    /// semantics (COMMIT vs RELEASE sp_<n>, the depth-gated mutex
-    /// release, etc.).
+    /// Transaction nesting depth: 0 = none, 1 = top-level BEGIN, 2+ = SAVEPOINT. Mirrors
+    /// `SqliteBackend.transaction_depth` — see that file for COMMIT vs RELEASE sp_<n> and mutex release.
     transaction_depth: u32 = 0,
-    /// Number of rows changed by the most recent data-mutating exec.
-    /// Populated after every successful `executeStatement` from
-    /// `PQcmdTuples(result)`. CREATE/SELECT statements reset it to 0.
+    /// Rows changed by the most recent data-mutating exec, parsed from `PQcmdTuples(result)`;
+    /// CREATE/SELECT statements reset it to 0.
     last_changes: i64 = 0,
 
     pub fn init(self: *PostgresBackend, io: std.Io, conninfo: [:0]const u8) Error!void {
@@ -158,14 +98,8 @@ pub const PostgresBackend = struct {
         }
         if (c.PQstatus(pgconn) != c.CONNECTION_OK) {
             c.PQfinish(pgconn);
-            // Map connection failures to the closest SQLite Error variant.
-            // PostgreSQL doesn't have distinct error codes for these at the
-            // connection level (vs server-side errors that come back via
-            // PGresult). We map any connection failure to OpenFailed — the
-            // caller sees one of OpenFailed vs DatabaseNotFound based on
-            // whether the server was reachable but the db was missing
-            // (we'd need a fallback SQL probe to distinguish, which is out
-            // of scope for the wrapper).
+            // Any connection-level failure maps to OpenFailed: libpq reports no distinct code here,
+            // and telling a missing db from an unreachable server would need a fallback SQL probe.
             return Error.OpenFailed;
         }
         self.conn = pgconn;
@@ -175,21 +109,13 @@ pub const PostgresBackend = struct {
         if (self.conn) |conn| {
             c.PQfinish(conn);
         }
-        // CRITICAL: null out `conn` after finishing so the Transaction
-        // code's `self.backend.conn == null` use-after-free guard fires.
-        // Mirrors the SQLite backend's `self.db = null` pattern.
+        // CRITICAL: null `conn` after finishing, or the Transaction code's `self.backend.conn == null`
+        // use-after-free guard never fires (mirrors SQLite's `self.db = null`).
         self.conn = null;
     }
 
-    /// Translate SQLite-style `?` placeholders to PostgreSQL `$N`
-    /// (1-indexed). Preserves `?` inside string literals, identifiers,
-    /// comments, and dollar-quoted strings.
-    ///
-    /// The translator walks the SQL byte-by-byte, tracking whether
-    /// we're inside a literal/comment. When we hit `?` in "code"
-    /// mode (outside any literal), we replace it with `$N` where N
-    /// increments from 1. The first `?` becomes `$1`, the second `$2`,
-    /// etc.
+    /// Translate SQLite-style `?` to PostgreSQL `$N` (1-indexed), numbering only placeholders seen in
+    /// code mode — `?` inside literals, identifiers, comments and dollar-quoted strings is preserved.
     fn translatePlaceholders(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(allocator);
@@ -281,11 +207,8 @@ pub const PostgresBackend = struct {
                 continue;
             }
 
-            // Dollar-quoted string: $tag$...$tag$ (PostgreSQL-specific,
-            // used for function bodies and similar). The tag is empty
-            // ($tag$ = just $$) or contains [_A-Za-z0-9]. If we don't
-            // see a closing $tag$, we pass the rest through unchanged
-            // so the server gets to error with its own message.
+            // Dollar-quoted string: $tag$...$tag$, tag empty or [_A-Za-z0-9]; an unterminated one is
+            // passed through unchanged so the server reports it.
             if (ch == '$') {
                 var tag_end: usize = i + 1;
                 while (tag_end < sql.len and
@@ -342,19 +265,14 @@ pub const PostgresBackend = struct {
         return out.toOwnedSlice(allocator);
     }
 
-    /// Allocate a NUL-terminated copy of `sql`. libpq's PQexecParams
-    /// requires `*[*:0]const u8` SQL — we cannot pass our arbitrary
-    /// slice directly. Caller frees with `allocator.free`.
+    /// Allocate a NUL-terminated copy of `sql` — libpq requires `*[*:0]const u8`, not a slice.
+    /// Caller frees with `allocator.free`.
     fn dupSqlZ(allocator: std.mem.Allocator, sql: []const u8) ![:0]u8 {
         return try allocator.allocSentinel(u8, sql.len, 0);
     }
 
-    /// Allocate NUL-terminated copies of every non-empty arg, plus a
-    /// parallel `?[*:0]const u8` array pointing to each (or `null` for
-    /// empty args — the SQL NULL convention).
-    ///
-    /// Returns the buffer pool (free in defer) and the pointer array
-    /// (free in defer).
+    /// NUL-terminated copies of every non-empty arg plus a parallel `?[*:0]const u8` array — `null`
+    /// for empty args, the SQL NULL convention. Caller frees the buffer pool and the pointer array.
     fn prepareParams(
         allocator: std.mem.Allocator,
         argv: []const []const u8,
@@ -379,12 +297,8 @@ pub const PostgresBackend = struct {
         return .{ .bufs = bufs, .values = values };
     }
 
-    /// Inner implementation: translate placeholders, allocate
-    /// NUL-terminated copies of args, run the statement on the
-    /// connection, check status, update `last_changes`. Caller MUST
-    /// hold the backend mutex. Used by both `exec` (with lock) and
-    /// `Transaction.exec` (without re-locking — the tx already holds
-    /// it).
+    /// Inner impl: translate, bind, run, then update `last_changes`. Caller MUST hold the backend
+    /// mutex — `exec` takes it, `Transaction.exec` does not (the tx already holds it).
     fn executeStatement(
         self: *PostgresBackend,
         allocator: std.mem.Allocator,
@@ -393,10 +307,8 @@ pub const PostgresBackend = struct {
     ) Error!void {
         const conn = self.conn orelse return Error.DatabaseNotFound;
 
-        // Empty SQL is a successful no-op. libpq would return
-        // PGRES_EMPTY_QUERY for this, but we treat it as a no-op
-        // up front to match SQLite's documented behavior — callers
-        // don't need to special-case "" themselves.
+        // Empty SQL is a successful no-op rather than libpq's PGRES_EMPTY_QUERY, matching SQLite, so
+        // callers never special-case "".
         if (sql.len == 0) {
             self.last_changes = 0;
             return;
@@ -467,10 +379,8 @@ pub const PostgresBackend = struct {
         return executeStatement(self, allocator, sql, argv);
     }
 
-    /// Inner implementation: prepare + bind + step ONCE for a
-    /// single-row SELECT. Caller MUST hold the backend mutex. Used
-    /// by both `queryRow` (with lock) and `Transaction.queryRow`
-    /// (without re-locking).
+    /// Inner impl: prepare, bind and step ONCE for a single-row SELECT. Caller MUST hold the backend
+    /// mutex — `queryRow` takes it, `Transaction.queryRow` does not.
     fn executeQueryRow(
         self: *PostgresBackend,
         allocator: std.mem.Allocator,
@@ -587,14 +497,11 @@ pub const PostgresBackend = struct {
         /// Total row count — captured at iteration start so we know
         /// when to return `null`.
         ntuples: c_int = 0,
-        /// Number of columns in the result — captured at iteration
-        /// start so each `next` can alloc the right-sized values
-        /// array.
+        /// Number of columns, captured at iteration start so each `next` can alloc the
+        /// right-sized values array.
         nfields: c_int = 0,
-        /// Most recent PostgreSQL error message. Captured the first
-        /// time `next()` would have returned an error (mirrors the
-        /// SQLite Rows.last_error_msg contract — see that file for
-        /// the rationale and the `getLastErrorMessage()` getter).
+        /// Most recent PostgreSQL error message, captured the first time `next()` would have errored;
+        /// mirrors the SQLite Rows.last_error_msg contract (see `getLastErrorMessage`).
         last_error_msg: ?[]u8 = null,
         done: bool = false,
 
@@ -609,10 +516,8 @@ pub const PostgresBackend = struct {
             }
         }
 
-        /// Capture `PQresultErrorMessage(result)` into `last_error_msg`
-        /// so callers can surface a useful error. Best-effort — silently
-        /// no-ops on allocation failure; the caller still gets the
-        /// Error enum either way.
+        /// Capture `PQresultErrorMessage(result)` into `last_error_msg`. Best-effort: a failed dupe
+        /// leaves it null, and the caller still gets the Error enum either way.
         fn captureError(self: *Rows) void {
             if (self.result) |r| {
                 const err_msg_c = c.PQresultErrorMessage(r);
@@ -622,17 +527,15 @@ pub const PostgresBackend = struct {
             }
         }
 
-        /// Returns the most recent PostgreSQL error message, or null
-        /// if no error has been captured yet. The slice is owned by
-        /// Rows and is valid until `deinit()` is called.
+        /// Most recent PostgreSQL error message, or null; the slice is owned by Rows and valid
+        /// until `deinit()`.
         pub fn getLastErrorMessage(self: *Rows) ?[]const u8 {
             return self.last_error_msg;
         }
 
         pub fn next(self: *Rows) Error!?Row {
-            // Defensive: once we've returned null (exhausted), keep
-            // returning null without further work. Mirrors the
-            // SQLite Rows.done guard.
+            // Once exhausted, keep returning null without further work (mirrors the SQLite
+            // Rows.done guard).
             if (self.done) return null;
             if (self.result == null) return null;
 
@@ -670,10 +573,8 @@ pub const PostgresBackend = struct {
         }
     };
 
-    /// Inner implementation: run a SELECT-like statement and return a
-    /// `Rows` iterator. Caller MUST hold the backend mutex. Used by
-    /// both `query` (with lock) and `Transaction.query` (without
-    /// re-locking).
+    /// Inner impl: run a SELECT-like statement and return a `Rows` iterator. Caller MUST hold the
+    /// backend mutex — `query` takes it, `Transaction.query` does not.
     fn executeQuery(
         self: *PostgresBackend,
         allocator: std.mem.Allocator,
@@ -717,17 +618,8 @@ pub const PostgresBackend = struct {
             null,
             0,
         );
-        // CRITICAL: do NOT `defer c.PQclear(result)` here. The Rows
-        // struct takes ownership of the result and will free it in
-        // Rows.deinit. A defer here would free the result BEFORE the
-        // test code can iterate via Rows.next — and `q.next()` would
-        // dereference freed memory, segfaulting on the first
-        // PQgetisnull/PQgetvalue call.
-        //
-        // The error paths below explicitly `c.PQclear(result)` before
-        // returning, so the result is always freed exactly once —
-        // either by `Rows.deinit` (success path) or by the explicit
-        // `c.PQclear` (error path).
+        // CRITICAL: no `defer c.PQclear(result)` here — `Rows` takes ownership and frees it in
+        // `Rows.deinit`, so a defer would free it before `next()` reads it; error paths clear explicitly.
 
         if (result == null) {
             return Error.QueryFailed;
@@ -756,12 +648,8 @@ pub const PostgresBackend = struct {
         return executeQuery(self, allocator, sql, argv);
     }
 
-    /// A database transaction. Mirrors `sqlite/Sqlite.zig::Transaction`
-    /// — same mutex semantics, same single-use enforcement, same
-    /// `commitOrRollback` defer idiom. See that file for the full
-    /// discussion of why the backend mutex is held for the entire tx
-    /// lifetime and why `db.exec()` from within the same thread would
-    /// deadlock.
+    /// A database transaction, mirroring `sqlite/Sqlite.zig::Transaction`: same mutex semantics and
+    /// single-use enforcement. The mutex is held for the whole tx, so `db.exec()` here would deadlock.
     pub const Transaction = struct {
         backend: *PostgresBackend,
         depth: u32,
@@ -824,19 +712,8 @@ pub const PostgresBackend = struct {
             return self._doFinalizeCommit();
         }
 
-        /// Commit the transaction if it has not yet been finalized.
-        /// Mirrors `sqlite/Sqlite.zig::Transaction::commitOrRollback`.
-        /// Canonical pattern:
-        ///
-        /// ```zig
-        /// var tx = try db.begin();
-        /// defer tx.commitOrRollback() catch {};
-        /// errdefer tx.rollback() catch {}; // atomic: error paths roll back
-        /// try tx.exec(alloc, "INSERT INTO foo VALUES (?)", &.{"a"});
-        /// try tx.commit();
-        /// ```
-        ///
-        /// Do NOT issue raw "BEGIN"/"COMMIT"/"ROLLBACK" via `db.exec()`.
+        /// Commit if not yet finalized (mirrors `sqlite/Sqlite.zig::Transaction::commitOrRollback`):
+        /// `defer tx.commitOrRollback() catch {}` plus `errdefer tx.rollback()`; never a raw BEGIN/COMMIT.
         pub fn commitOrRollback(self: *Transaction) Error!void {
             if (self.completed) return;
             return self._doFinalizeCommit();
@@ -881,9 +758,8 @@ pub const PostgresBackend = struct {
         }
     };
 
-    /// Begin a new top-level transaction. Mirrors
-    /// `sqlite/Sqlite.zig::begin` — same mutex semantics, same
-    /// BEGIN/COMMIT/ROLLBACK SQL.
+    /// Begin a new top-level transaction — same mutex semantics and BEGIN/COMMIT/ROLLBACK SQL as
+    /// `sqlite/Sqlite.zig::begin`.
     pub fn begin(self: *PostgresBackend) Error!Transaction {
         if (self.conn == null) return Error.DatabaseNotFound;
 
@@ -909,9 +785,8 @@ pub const PostgresBackend = struct {
         };
     }
 
-    /// Open a nested savepoint within the current transaction. The
-    /// savepoint is named `sp_<depth>` (auto-generated based on the
-    /// current depth). Mirrors `sqlite/Sqlite.zig::savepoint`.
+    /// Open a nested savepoint named `sp_<depth>`, auto-generated from the current depth; mirrors
+    /// `sqlite/Sqlite.zig::savepoint`.
     pub fn savepoint(self: *PostgresBackend) Error!Transaction {
         if (self.conn == null) return Error.DatabaseNotFound;
         if (self.transaction_depth == 0) return Error.ExecuteFailed;
@@ -919,15 +794,8 @@ pub const PostgresBackend = struct {
         self.transaction_depth += 1;
         const new_depth = self.transaction_depth;
 
-        // Format the SQL and pass it to libpq as a NUL-terminated
-        // many-pointer. We use a `[:0]const u8` (sentinel-terminated
-        // slice) cast from a stack-allocated `[:0]u8` rather than
-        // a fixed-size `[N:0]u8` array — the latter has an implicit
-        // sentinel at the array's NATURAL end position (e.g. position
-        // 32 for `[32:0]u8`), and libpq's PQexec will read up to that
-        // natural sentinel, consuming the stack's undefined tail
-        // past our runtime NUL. Using `[:0]u8` directly makes the
-        // slice end at the runtime NUL we set.
+        // Pass the SQL as a `[:0]const u8`, never a bare `[32:0]u8`: `[N:0]u8` has its implicit sentinel
+        // at the array's natural end, so PQexec would read past our runtime NUL into the stack tail.
         var sql_buf: [32:0]u8 = undefined;
         const written = std.fmt.bufPrint(sql_buf[0..31], "SAVEPOINT sp_{d}", .{new_depth}) catch
             return Error.ExecuteFailed;
@@ -953,10 +821,8 @@ pub const PostgresBackend = struct {
         };
     }
 
-    /// Number of rows changed by the most recent INSERT/UPDATE/DELETE
-    /// statement. Mirrors `sqlite/Sqlite.zig::changes()` — same
-    /// contract, different underlying call (`PQcmdTuples(PGresult)`
-    /// instead of `sqlite3_changes(PGconn)`).
+    /// Rows changed by the most recent INSERT/UPDATE/DELETE — same contract as
+    /// `sqlite/Sqlite.zig::changes()`, backed by `PQcmdTuples(PGresult)` instead of `sqlite3_changes`.
     pub fn changes(self: *PostgresBackend) i64 {
         return self.last_changes;
     }

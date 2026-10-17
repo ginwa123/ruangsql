@@ -1,30 +1,12 @@
-//! Unified database interface — import this, not `sqlite` / `postgres`.
-//!
-//!   const database = @import("databases").database;
-//!   var db: database.Db = .{};
-//!   try database.open(&db, io, .{ .sqlite_path = db_path });
-//!
-//! The concrete type behind `Db` is chosen at COMPILE time by the app's
-//! root `build.zig` (`-Ddb_used`, default `"sqlite"`). The unchosen
-//! backend is never `@import`ed, so its `@cImport` headers and link libs
-//! are never needed even though the source stays on disk:
-//!
-//!   - `-Ddb_used=sqlite` (default): `Db == SqliteBackend`, no libpq.
-//!   - `-Ddb_used=sqlite,postgres`:  `Db == PostgresBackend`, needs libpq.
-//!
-//! Both backends share the same method set (`exec` / `query` / `queryRow`
-//! / `changes` / `begin` / `savepoint` / `deinit`) and the same `Error`
-//! variants by design, so call sites stay duck-typed. Only `init` differs
-//! (file path vs conninfo) — the `open()` helper below hides that gap
-//! behind `OpenConfig`.
+//! Unified database interface — import this, not `sqlite` / `postgres`. `Db` is
+//! picked at COMPILE time from `-Ddb_used`; both backends share one method set and `Error` set by design, so call sites stay duck-typed.
 
 const std = @import("std");
 const build_options = @import("build_options");
 const sqlite_mod = @import("sqlite/Sqlite.zig");
 
-// Conditional import: when the app builds sqlite-only (the default),
-// this resolves to `struct {}` and the compiler never opens
-// `postgres/Postgres.zig` — no `libpq-fe.h` needed, no `PQ*` symbols.
+// Conditional import: sqlite-only builds (the default) resolve this to `struct {}`,
+// so the compiler never opens `postgres/Postgres.zig` — no `libpq-fe.h`, no `PQ*` symbols.
 const postgres_mod = if (build_options.enable_postgres)
     @import("postgres/Postgres.zig")
 else
@@ -33,10 +15,8 @@ else
 /// True when the app listed postgres in `-Ddb_used`.
 pub const backend_is_postgres: bool = build_options.enable_postgres;
 
-/// The unified backend type. Import this, not `SqliteBackend` /
-/// `PostgresBackend` directly. When sqlite-only, `Db` IS
-/// `SqliteBackend` (same type — existing `*SqliteBackend` signatures
-/// keep compiling untouched during migration).
+/// The unified backend type — import this, not `SqliteBackend` / `PostgresBackend`:
+/// when sqlite-only, `Db` IS `SqliteBackend`, so `*SqliteBackend` signatures keep compiling.
 pub const Db = if (backend_is_postgres)
     postgres_mod.PostgresBackend
 else
@@ -46,15 +26,8 @@ else
 /// unified error type.
 pub const Error = sqlite_mod.Error;
 
-/// Explicit backend-or-transaction handle for helpers that run both
-/// outside a tx (`db`) and inside one (`tx`). Every accepted type is
-/// listed here and dispatch is an exhaustive switch, so misuse fails
-/// to compile at the call site. Construct with `.{ .db = db }` or
-/// `.{ .tx = &tx }`.
-///
-/// `Db` (and its `Transaction` / `Rows` / `Row`) resolves to the
-/// backend the app selected via `-Ddb_used`, so this union works for
-/// both sqlite and postgres builds.
+/// Explicit backend-or-transaction handle (`.{ .db = db }` / `.{ .tx = &tx }`) for
+/// helpers that run both outside and inside a tx: dispatch is an exhaustive switch, so misuse fails to compile.
 pub const DbOrTx = union(enum) {
     db: *Db,
     tx: *Db.Transaction,
@@ -96,18 +69,15 @@ pub const DbOrTx = union(enum) {
     }
 };
 
-/// Unified open config — hides the path-vs-conninfo `init` gap.
-/// Only the variant matching the compiled backend is ever constructed
-/// in practice; `open()` dispatches at comptime to the single `init`
-/// signature that exists.
+/// Unified open config — hides the path-vs-conninfo `init` gap: only the variant
+/// matching the compiled backend is ever constructed; `open()` dispatches at comptime.
 pub const OpenConfig = union(enum) {
     sqlite_path: [:0]const u8,
     postgres_conninfo: [:0]const u8,
 };
 
-/// Open `db` with the given config. Thin wrapper over the backend's
-/// `init(io, path_or_conninfo)` — both backends take
-/// `(std.Io, [:0]const u8)`, so this inlines to a single call.
+/// Open `db` with the given config — a thin wrapper over the backend's `init`, which
+/// both backends take as `(std.Io, [:0]const u8)`, so this inlines to one call.
 pub fn open(db: *Db, io: std.Io, cfg: OpenConfig) Error!void {
     switch (cfg) {
         .sqlite_path => |p| try db.init(io, p),
@@ -115,19 +85,12 @@ pub fn open(db: *Db, io: std.Io, cfg: OpenConfig) Error!void {
     }
 }
 
-/// The SQLite connection policy `openWithConfig` accepts. Re-exported so a
-/// consumer can name it without reaching into the `sqlite` namespace —
-/// `database.openWithConfig(&db, io, .{ .sqlite_path = p }, .{ .synchronous = .normal })`.
+/// The SQLite connection policy `openWithConfig` accepts, re-exported so a consumer
+/// can name it without reaching into the `sqlite` namespace.
 pub const SqliteConfig = sqlite_mod.Config;
 
-/// Open `db` with an explicit SQLite connection policy.
-///
-/// `sqlite_config` is IGNORED on the postgres backend (that backend has no
-/// pragmas). Passing it keeps `main.zig` compiling under both
-/// `-Ddb_used=sqlite` and `-Ddb_used=sqlite,postgres` without a comptime
-/// branch at every call site.
-///
-/// `open` is exactly `openWithConfig(db, io, cfg, .{})`.
+/// Open `db` with an explicit SQLite connection policy. `sqlite_config` is IGNORED
+/// on the postgres backend (no pragmas), which is what keeps call sites compiling under both.
 pub fn openWithConfig(db: *Db, io: std.Io, cfg: OpenConfig, sqlite_config: SqliteConfig) Error!void {
     if (backend_is_postgres) {
         switch (cfg) {
@@ -152,8 +115,7 @@ test "database.Db resolves to the backend the app selected" {
         try testing.expect(Db == postgres_mod.PostgresBackend);
     } else {
         // Sqlite-only (default): Db IS SqliteBackend, so every existing
-        // `*sqlite.SqliteBackend` signature accepts a `*database.Db`
-        // untouched during migration.
+        // `*sqlite.SqliteBackend` signature accepts a `*database.Db` untouched.
         try testing.expect(Db == sqlite_mod.SqliteBackend);
     }
 }
