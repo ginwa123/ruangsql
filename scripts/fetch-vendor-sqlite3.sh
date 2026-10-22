@@ -70,7 +70,7 @@ fi
 mkdir -p "${DEST}"
 
 # Use a per-PID temp dir; clean up on exit.
-TMP=$(mktemp -d "${TMPDIR:-/tmp}/nalar-sqlite3-XXXXXX" 2>/dev/null || mktemp -d)
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/ruangsql-sqlite3-XXXXXX" 2>/dev/null || mktemp -d)
 trap 'rm -rf "${TMP}"' EXIT
 
 echo "Fetching SQLite ${SQLITE_VERSION} amalgamation from ${URL} ..."

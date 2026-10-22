@@ -89,7 +89,7 @@ test "init on a non-existent database returns an error" {
 
     // The base conninfo points to dbname=postgres. Override to a
     // dbname that won't exist.
-    const bad = "host=/tmp port=54329 user=ginwa dbname=nalar_definitely_not_a_db connect_timeout=1";
+    const bad = "host=/tmp port=54329 user=ginwa dbname=ruangsql_definitely_not_a_db connect_timeout=1";
     var threaded = std.Io.Threaded.init(alloc, .{});
     defer threaded.deinit();
     const io = threaded.io();

@@ -2,8 +2,8 @@
 
 > WARNING: This repo is AI slop and experimental, DO NOT USE IN PRODUCTION!!!!!!
 
-Self-contained Zig package exposing the sqlite3 + libpq bindings used by
-nalarcore. Extracted from `ginwaaitoolbox/src/modules/databases/`.
+Self-contained Zig package exposing the sqlite3 + libpq bindings. Extracted
+from `ginwaaitoolbox/src/modules/databases/`.
 
 Consumers add it via `zig fetch` and wire it with `b.dependency`:
 
@@ -42,14 +42,49 @@ const postgres = @import("databases").postgres; // only with -Ddb_used=...,postg
   Zig `0.16.0`). Probes the host for system sqlite3 / libpq / openssl and
   falls back to the vendored amalgamation.
 - `src/root.zig` — public API root.
-- `src/database.zig` — unified `Db` interface (compile-time backend choice).
+- `src/database.zig` — unified `Db` interface (compile-time backend choice) and
+  the universal `createTempDb`.
 - `src/sqlite/` — `Sqlite.zig` + tests.
-- `src/postgres/` — `Postgres.zig`, `test_helpers.zig` + tests.
+- `src/postgres/` — `Postgres.zig`, `temp_db.zig` (temp-database primitives),
+  `test_helpers.zig` + tests.
 - `src/test_runner.zig` — aggregates the test suite (`postgres` tests only
   run when `-Ddb_used` includes `postgres`).
 - `scripts/fetch-vendor-sqlite3.sh` — downloads the SQLite amalgamation
   into `vendor/sqlite3/` (gitignored). Needed on macOS / Windows and for
   cross-compiles; Linux native builds use system libsqlite3 instead.
+
+## Temp database
+
+One call, whichever backend `-Ddb_used` compiled in:
+
+```zig
+var temp = try database.createTempDb(allocator, .{});
+defer temp.deinit();
+
+try temp.db.exec(allocator, "CREATE TABLE t (x TEXT)", &.{});
+```
+
+`temp.db` is a `database.Db`, so every `exec` / `query` / `queryRow` call below that
+line is identical under both backends. What the one call does per backend:
+
+- **sqlite** — opens a private `:memory:` database (`temp.db_name == ":memory:"`).
+  Pooling is skipped: an in-memory database belongs to the connection that opened it.
+- **postgres** — `CREATE DATABASE ruangsql_pg_test_<tid>_<n>` on the instance in
+  `POSTGRES_TEST_CONNINFO` (else the built-in local default), then a `PostgresBackend`
+  on that database. `deinit()` drops it again with `DROP DATABASE ... WITH (FORCE)`,
+  so a failed test leaves no stray database behind.
+
+`createTempDb` owns the `std.Io` runtime it hands back, which is why `deinit()` takes
+no arguments and why a `TempDb` is never stack-initialised by hand. Pass
+`TempDbOptions{ .base_conninfo = ..., .config = ... }` to point the postgres half at a
+different instance or to size its connection pool.
+
+A suite that must self-skip when no PostgreSQL server is reachable asks first, instead
+of failing:
+
+```zig
+if (!database.tempDbAvailable()) return; // always true on sqlite
+```
 
 ## PostgreSQL backend
 

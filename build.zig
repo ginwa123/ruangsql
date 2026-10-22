@@ -1,5 +1,5 @@
-//! `databases` package — self-contained Zig package exposing the sqlite3 + libpq bindings
-//! used by nalarcore; per-target system-lib probing with a vendored amalgamation fallback.
+//! `databases` package — self-contained Zig package exposing the sqlite3 + libpq bindings,
+//! with per-target system-lib probing and a vendored amalgamation fallback.
 
 const std = @import("std");
 const builtin = @import("builtin");

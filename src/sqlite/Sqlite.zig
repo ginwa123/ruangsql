@@ -1,4 +1,4 @@
-//! SQLite backend for every nalar database: `exec` / `query` / `queryRow`, plus a `Transaction` RAII type for multi-statement atomic work.
+//! SQLite backend for every ruangsql database: `exec` / `query` / `queryRow`, plus a `Transaction` RAII type for multi-statement atomic work.
 //! See `sqlite_test.zig` for the canonical API doc; the `c` declarations are platform-scoped (Linux `@cImport`, macOS/Windows manual externs).
 
 const std = @import("std");

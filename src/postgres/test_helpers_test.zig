@@ -47,8 +47,8 @@ test "createTempDb returns a unique, open, working backend" {
     try testing.expectEqualStrings("1", row.values[0]);
 
     // db_name is non-empty and NUL-prefixed via the standard
-    // nalar_pg_test_<pid>_<counter> scheme.
-    try testing.expect(std.mem.startsWith(u8, ctx.db_name, "nalar_pg_test_"));
+    // ruangsql_pg_test_<pid>_<counter> scheme.
+    try testing.expect(std.mem.startsWith(u8, ctx.db_name, "ruangsql_pg_test_"));
 }
 
 test "createTempDb is isolated: two calls produce independent DBs" {
@@ -176,7 +176,7 @@ test "createDatabase: standalone helper creates a database on the shared instanc
     const pid_bits: u64 = @intCast(std.os.linux.gettid());
     const counter_value = helpers.nextDbCounter();
     const db_name = try std.fmt.allocPrint(alloc,
-        "nalar_pg_test_helper_{x}_{x}",
+        "ruangsql_pg_test_helper_{x}_{x}",
         .{ pid_bits, counter_value });
     defer alloc.free(db_name);
 
@@ -208,7 +208,7 @@ test "createDatabase: failure on bad admin conninfo returns DatabaseNotFound" {
     const env = helpers.getOrStartTestInstance(alloc);
     if (!env.is_available) return;
 
-    const db_name = "nalar_pg_test_should_not_exist";
+    const db_name = "ruangsql_pg_test_should_not_exist";
     const result = helpers.createDatabase(alloc,
         "host=/tmp port=1 user=ginwa dbname=postgres connect_timeout=1", db_name);
     try testing.expectError(helpers.PostgresError.DatabaseNotFound, result);
@@ -222,7 +222,7 @@ test "dropDatabase: standalone helper drops a database (no TestDb needed)" {
     const pid_bits: u64 = @intCast(std.os.linux.gettid());
     const counter_value = helpers.nextDbCounter();
     const db_name = try std.fmt.allocPrint(alloc,
-        "nalar_pg_test_drop_helper_{x}_{x}",
+        "ruangsql_pg_test_drop_helper_{x}_{x}",
         .{ pid_bits, counter_value });
     defer alloc.free(db_name);
 
@@ -260,7 +260,7 @@ test "dropDatabase: non-fatal on missing database (IF EXISTS branch)" {
 
     // Drop a database that doesn't exist — must not crash, must not
     // return an error (the function returns void).
-    helpers.dropDatabase(alloc, env.conninfo, "nalar_pg_test_definitely_not_real_zzz");
+    helpers.dropDatabase(alloc, env.conninfo, "ruangsql_pg_test_definitely_not_real_zzz");
 }
 
 test "dropDatabase: non-fatal on bad admin conninfo" {
@@ -271,14 +271,14 @@ test "dropDatabase: non-fatal on bad admin conninfo" {
     // Bad conninfo — must not crash, must not return anything.
     helpers.dropDatabase(alloc,
         "host=/tmp port=1 user=ginwa dbname=postgres connect_timeout=1",
-        "nalar_pg_test_anything");
+        "ruangsql_pg_test_anything");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  LEAK-PREVENTION TESTS — the three that matter for production confidence
 
 // Concurrent createTempDb/dropTempDb must not crash and must yield distinct databases;
-// after stress runs no fds leak and no `nalar_pg_test_*` row survives in pg_database.
+// after stress runs no fds leak and no `ruangsql_pg_test_*` row survives in pg_database.
 
 
 test "LEAK: no fd leaks — open+drop fd count is stable across 10 sequential cycles" {
@@ -324,7 +324,7 @@ test "LEAK: no stray databases — pg_database is empty after a stress run" {
         helpers.dropTempDb(alloc, &ctx);
     }
 
-    // Probe pg_database directly via libpq. Any nalar_pg_test_* entry
+    // Probe pg_database directly via libpq. Any ruangsql_pg_test_* entry
     // is a leak.
     const probe = PostgresBackend.c.PQconnectdb(env.conninfo.ptr);
     defer if (probe) |p| PostgresBackend.c.PQfinish(p);
@@ -333,7 +333,7 @@ test "LEAK: no stray databases — pg_database is empty after a stress run" {
 
     var sql_buf: [256]u8 = undefined;
     const sql = std.fmt.bufPrint(&sql_buf,
-        "SELECT count(*) FROM pg_database WHERE datname LIKE 'nalar_pg_test_%'", .{}) catch return;
+        "SELECT count(*) FROM pg_database WHERE datname LIKE 'ruangsql_pg_test_%'", .{}) catch return;
     const sql_z = try alloc.allocSentinel(u8, sql.len, 0);
     defer alloc.free(sql_z);
     @memcpy(sql_z, sql);
@@ -345,7 +345,7 @@ test "LEAK: no stray databases — pg_database is empty after a stress run" {
     const count_str = PostgresBackend.c.PQgetvalue(res, 0, 0);
     const leaked = std.fmt.parseInt(usize, std.mem.span(count_str), 10) catch 0;
     if (leaked > 0) {
-        std.debug.print("LEAK: {d} stray nalar_pg_test_* databases on server after {d} cycles\n", .{ leaked, CYCLES });
+        std.debug.print("LEAK: {d} stray ruangsql_pg_test_* databases on server after {d} cycles\n", .{ leaked, CYCLES });
     }
     try testing.expectEqual(@as(usize, 0), leaked);
 }
