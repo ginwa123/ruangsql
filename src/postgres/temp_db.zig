@@ -35,7 +35,7 @@ pub fn nextDbCounter() u64 {
 
 /// A fresh database name this process has not used before.
 pub fn uniqueDbName(allocator: std.mem.Allocator) Error![]u8 {
-    const tid: u64 = @intCast(std.os.linux.gettid());
+    const tid: u64 = @intCast(std.Thread.getCurrentId());
     return std.fmt.allocPrint(allocator, "ruangsql_pg_test_{x}_{x}", .{ tid, nextDbCounter() });
 }
 
