@@ -12,6 +12,11 @@ const postgres_mod = if (build_options.enable_postgres)
 else
     struct {};
 
+const pg_temp_db = if (build_options.enable_postgres)
+    @import("postgres/temp_db.zig")
+else
+    struct {};
+
 /// True when the app listed postgres in `-Ddb_used`.
 pub const backend_is_postgres: bool = build_options.enable_postgres;
 
@@ -119,6 +124,124 @@ pub fn openConfigured(db: *Db, io: std.Io, cfg: OpenConfig, config: Config) Erro
             .postgres_conninfo => unreachable,
         }
     }
+}
+
+/// A disposable database plus the `std.Io` runtime that serves it. `deinit()` closes
+/// the backend and, on postgres, drops the database again; it is safe to call twice.
+pub const TempDb = struct {
+    db: Db,
+    threaded: std.Io.Threaded,
+    /// Owned name of the database: `:memory:` on sqlite, `ruangsql_pg_test_<tid>_<n>` on postgres.
+    db_name: []u8,
+    /// Conninfo of the instance the database lives on; empty on sqlite.
+    base_conninfo: []const u8,
+    allocator: std.mem.Allocator,
+    live: bool = true,
+
+    pub fn deinit(self: *TempDb) void {
+        if (!self.live) return;
+        self.live = false;
+
+        self.db.deinit();
+        self.threaded.deinit();
+        dropTempDatabase(self);
+        self.allocator.free(self.db_name);
+    }
+};
+
+const dropTempDatabase = if (backend_is_postgres) dropPostgresTempDatabase else dropNoTempDatabase;
+
+fn dropPostgresTempDatabase(temp: *TempDb) void {
+    pg_temp_db.dropDatabase(temp.allocator, temp.base_conninfo, temp.db_name);
+}
+
+fn dropNoTempDatabase(temp: *TempDb) void {
+    _ = temp;
+}
+
+/// Knobs for `createTempDb`. The half that belongs to the backend NOT compiled in is
+/// ignored, so the same call site compiles under either `-Ddb_used` list.
+pub const TempDbOptions = struct {
+    /// Postgres only: the instance to CREATE DATABASE on. null = `POSTGRES_TEST_CONNINFO`, else the built-in local default.
+    base_conninfo: ?[:0]const u8 = null,
+    config: Config = .{},
+};
+
+/// Create a database this caller owns outright, whichever backend was compiled in:
+/// sqlite opens a private `:memory:` database, postgres CREATEs a uniquely named one.
+pub fn createTempDb(allocator: std.mem.Allocator, options: TempDbOptions) Error!TempDb {
+    return createTempDbFor(allocator, options);
+}
+
+const createTempDbFor = if (backend_is_postgres) createTempDbPostgres else createTempDbSqlite;
+
+fn createTempDbSqlite(allocator: std.mem.Allocator, options: TempDbOptions) Error!TempDb {
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    errdefer threaded.deinit();
+
+    const db_name = try allocator.dupe(u8, ":memory:");
+    errdefer allocator.free(db_name);
+
+    var cfg = options.config.sqlite;
+    if (cfg.allocator == null) cfg.allocator = allocator;
+
+    var db: Db = .{};
+    errdefer db.deinit();
+    try db.initWithConfig(threaded.io(), ":memory:", cfg);
+
+    return .{
+        .db = db,
+        .threaded = threaded,
+        .db_name = db_name,
+        .base_conninfo = "",
+        .allocator = allocator,
+    };
+}
+
+fn createTempDbPostgres(allocator: std.mem.Allocator, options: TempDbOptions) Error!TempDb {
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    errdefer threaded.deinit();
+
+    const base_conninfo = options.base_conninfo orelse pg_temp_db.resolveBaseConninfo();
+    const db_name = try pg_temp_db.uniqueDbName(allocator);
+    errdefer allocator.free(db_name);
+
+    try pg_temp_db.createDatabase(allocator, base_conninfo, db_name);
+    errdefer pg_temp_db.dropDatabase(allocator, base_conninfo, db_name);
+
+    const db_conninfo = try pg_temp_db.buildDbConninfo(allocator, base_conninfo, db_name);
+    defer allocator.free(db_conninfo);
+
+    var cfg = options.config.postgres;
+    if (cfg.allocator == null) cfg.allocator = allocator;
+
+    var db: Db = .{};
+    errdefer db.deinit();
+    try db.initWithConfig(threaded.io(), db_conninfo, cfg);
+
+    return .{
+        .db = db,
+        .threaded = threaded,
+        .db_name = db_name,
+        .base_conninfo = base_conninfo,
+        .allocator = allocator,
+    };
+}
+
+/// Whether `createTempDb` can work here: always true on sqlite, one connect attempt
+/// on postgres. A test suite calls it to skip itself instead of failing.
+pub fn tempDbAvailable() bool {
+    return tempDbAvailableFor();
+}
+
+const tempDbAvailableFor = if (backend_is_postgres) tempDbAvailablePostgres else tempDbAvailableSqlite;
+
+fn tempDbAvailableSqlite() bool {
+    return true;
+}
+
+fn tempDbAvailablePostgres() bool {
+    return pg_temp_db.probe(pg_temp_db.resolveBaseConninfo());
 }
 
 test {

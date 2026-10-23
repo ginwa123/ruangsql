@@ -151,7 +151,7 @@ test "init on file-backed path creates the file" {
 
     // A static literal is sentinel-terminated, matching `init`'s `[:0]const u8`;
     // `defer deleteFile` keeps later runs starting fresh.
-    const path = "/tmp/nalar_sqlite_test_create.db";
+    const path = "/tmp/ruangsql_sqlite_test_create.db";
     var threaded = std.Io.Threaded.init(alloc, .{});
     defer threaded.deinit();
     const io = threaded.io();

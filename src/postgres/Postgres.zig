@@ -1,4 +1,4 @@
-//! PostgreSQL backend for nalar — same public surface and `Error` variants as `sqlite/Sqlite.zig`
+//! PostgreSQL backend for ruangsql — same public surface and `Error` variants as `sqlite/Sqlite.zig`
 //! so the two stay swappable. `init` takes a libpq conninfo string; `?` args rewrite to `$N`.
 
 const std = @import("std");

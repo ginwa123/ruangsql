@@ -31,7 +31,7 @@ const Ctx = struct {
 };
 
 fn setupDb(alloc: std.mem.Allocator, io: std.Io, base_conninfo: []const u8, cfg: Config) !Ctx {
-    const db_name = try std.fmt.allocPrint(alloc, "nalar_pg_pool_{x}", .{helpers.nextDbCounter()});
+    const db_name = try std.fmt.allocPrint(alloc, "ruangsql_pg_pool_{x}", .{helpers.nextDbCounter()});
     errdefer alloc.free(db_name);
 
     var created = false;
