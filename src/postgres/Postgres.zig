@@ -183,6 +183,49 @@ pub const PostgresBackend = struct {
     /// interval instead of once per statement.
     fallback_logged_ms: std.atomic.Value(i64) = .init(0),
 
+    /// Most recent PostgreSQL error text (libpq's for a failed connection, the server's for a failed
+    /// statement): owned here, freed by `deinit()`, handed out by `getLastErrorMessage()`.
+    last_error_msg: ?[]u8 = null,
+
+    /// Replace `last_error_msg` with `text` — best-effort, because the call recording a failure is
+    /// already failing: an allocation failure keeps the previous message instead of adding an error.
+    fn rememberError(self: *PostgresBackend, text: []const u8) void {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return;
+        const copy = self.owned_alloc.dupe(u8, trimmed) catch return;
+        if (self.last_error_msg) |old| self.owned_alloc.free(old);
+        self.last_error_msg = copy;
+    }
+
+    /// Record libpq's diagnosis of a failed CONNECTION (`PQerrorMessage`) — the only text an
+    /// `OpenFailed` ever has.
+    fn rememberConnError(self: *PostgresBackend, conn: ?*c.PGconn) void {
+        const handle = conn orelse return;
+        self.rememberError(std.mem.span(c.PQerrorMessage(handle)));
+    }
+
+    /// Record the server's diagnosis of a failed statement (`PQresultErrorMessage`), falling back to
+    /// the connection's own message when libpq produced no result at all.
+    fn rememberResultError(self: *PostgresBackend, result: ?*c.PGresult) void {
+        if (result) |r| {
+            self.rememberError(std.mem.span(c.PQresultErrorMessage(r)));
+            return;
+        }
+        self.rememberConnError(self.conn);
+    }
+
+    /// Copy `other`'s recorded failure onto this handle: a pooled connection ran the statement, but the
+    /// caller only holds the backend it called `exec` / `query` / `queryRow` on.
+    fn adoptLastError(self: *PostgresBackend, other: *PostgresBackend) void {
+        if (other.last_error_msg) |msg| self.rememberError(msg);
+    }
+
+    /// Most recent PostgreSQL error text, or null when nothing has failed yet: valid until the next
+    /// failure or `deinit()`, and named to match `Rows.getLastErrorMessage`.
+    pub fn getLastErrorMessage(self: *PostgresBackend) ?[]const u8 {
+        return self.last_error_msg;
+    }
+
     /// Open `conninfo` with the default `Config`.
     pub fn init(self: *PostgresBackend, io: std.Io, conninfo: [:0]const u8) Error!void {
         return self.initWithConfig(io, conninfo, .{});
@@ -225,6 +268,8 @@ pub const PostgresBackend = struct {
             return Error.OutOfMemory;
         };
         if (c.PQstatus(pgconn) != c.CONNECTION_OK) {
+            // Capture BEFORE `PQfinish`: the message lives on the connection being thrown away.
+            slot.rememberConnError(pgconn);
             c.PQfinish(pgconn);
             // Any connection-level failure maps to OpenFailed: libpq reports no distinct code here,
             // and telling a missing db from an unreachable server would need a fallback SQL probe.
@@ -234,6 +279,10 @@ pub const PostgresBackend = struct {
     }
 
     pub fn deinit(self: *PostgresBackend) void {
+        if (self.last_error_msg) |msg| {
+            self.owned_alloc.free(msg);
+            self.last_error_msg = null;
+        }
         // Pooled connections are owned by this backend; close them with it.
         if (self.pool.enabled) self.pool.closeAll(self.io);
         self.forgetStatements();
@@ -568,9 +617,13 @@ pub const PostgresBackend = struct {
                 return;
             },
             c.PGRES_FATAL_ERROR, c.PGRES_NONFATAL_ERROR => {
+                self.rememberResultError(result);
                 return Error.ExecuteFailed;
             },
-            else => return Error.ExecuteFailed,
+            else => {
+                self.rememberResultError(result);
+                return Error.ExecuteFailed;
+            },
         }
     }
 
@@ -585,7 +638,10 @@ pub const PostgresBackend = struct {
         defer self.pool.release(self.io, slot);
         try slot.mutex.lock(slot.io);
         defer slot.mutex.unlock(slot.io);
-        try executeStatement(slot, allocator, sql, argv);
+        executeStatement(slot, allocator, sql, argv) catch |err| {
+            self.adoptLastError(slot);
+            return err;
+        };
         // `changes()` reads THIS backend, and the statement just ran on `slot`.
         self.last_changes.store(slot.last_changes.load(.monotonic), .monotonic);
     }
@@ -619,6 +675,7 @@ pub const PostgresBackend = struct {
         const result = self.runStatement(conn, sql, sql_z, values, argv.len);
 
         if (result == null) {
+            self.rememberConnError(conn);
             return Error.QueryFailed;
         }
         defer c.PQclear(result);
@@ -633,6 +690,7 @@ pub const PostgresBackend = struct {
             },
             c.PGRES_EMPTY_QUERY => return Error.RowNotFound,
             else => {
+                self.rememberResultError(result);
                 return Error.QueryFailed;
             },
         }
@@ -681,7 +739,11 @@ pub const PostgresBackend = struct {
         defer self.pool.release(self.io, slot);
         try slot.mutex.lock(slot.io);
         defer slot.mutex.unlock(slot.io);
-        return executeQueryRow(slot, allocator, sql, argv);
+        const row = executeQueryRow(slot, allocator, sql, argv) catch |err| {
+            self.adoptLastError(slot);
+            return err;
+        };
+        return row;
     }
 
     pub const Row = struct {
@@ -822,6 +884,7 @@ pub const PostgresBackend = struct {
         // `Rows.deinit`, so a defer would free it before `next()` reads it; error paths clear explicitly.
 
         if (result == null) {
+            self.rememberConnError(conn);
             return Error.QueryFailed;
         }
 
@@ -829,6 +892,7 @@ pub const PostgresBackend = struct {
         switch (status) {
             c.PGRES_TUPLES_OK => {},
             else => {
+                self.rememberResultError(result);
                 c.PQclear(result);
                 return Error.QueryFailed;
             },
@@ -854,7 +918,11 @@ pub const PostgresBackend = struct {
         defer self.pool.release(self.io, slot);
         try slot.mutex.lock(slot.io);
         defer slot.mutex.unlock(slot.io);
-        return executeQuery(slot, allocator, sql, argv);
+        const rows = executeQuery(slot, allocator, sql, argv) catch |err| {
+            self.adoptLastError(slot);
+            return err;
+        };
+        return rows;
     }
 
     /// A database transaction, mirroring `sqlite/Sqlite.zig::Transaction`: same mutex semantics and single-use enforcement. It runs on the PRIMARY
@@ -898,6 +966,7 @@ pub const PostgresBackend = struct {
             const result = c.PQexec(conn, sql_z.ptr);
             defer if (result) |r| c.PQclear(r);
             if (result == null) {
+                self.backend.rememberConnError(conn);
                 self.completed = true;
                 self.backend.transaction_depth -= 1;
                 if (self.depth == 1) self.backend.mutex.unlock(self.backend.io);
@@ -911,6 +980,7 @@ pub const PostgresBackend = struct {
             switch (status) {
                 c.PGRES_COMMAND_OK => return,
                 else => {
+                    self.backend.rememberResultError(result);
                     return Error.ExecuteFailed;
                 },
             }
@@ -948,6 +1018,7 @@ pub const PostgresBackend = struct {
             const result = c.PQexec(conn, sql_z.ptr);
             defer if (result) |r| c.PQclear(r);
             if (result == null) {
+                self.backend.rememberConnError(conn);
                 self.completed = true;
                 self.backend.transaction_depth -= 1;
                 if (self.depth == 1) self.backend.mutex.unlock(self.backend.io);
@@ -961,6 +1032,7 @@ pub const PostgresBackend = struct {
             switch (status) {
                 c.PGRES_COMMAND_OK => return,
                 else => {
+                    self.backend.rememberResultError(result);
                     return Error.ExecuteFailed;
                 },
             }
@@ -979,10 +1051,12 @@ pub const PostgresBackend = struct {
         const result = c.PQexec(self.conn.?, "BEGIN");
         defer if (result) |r| c.PQclear(r);
         if (result == null) {
+            self.rememberConnError(self.conn);
             return Error.ExecuteFailed;
         }
         const status = c.PQresultStatus(result);
         if (status != c.PGRES_COMMAND_OK) {
+            self.rememberResultError(result);
             return Error.ExecuteFailed;
         }
 
@@ -1014,11 +1088,13 @@ pub const PostgresBackend = struct {
         const result = c.PQexec(self.conn.?, sql_z.ptr);
         defer if (result) |r| c.PQclear(r);
         if (result == null) {
+            self.rememberConnError(self.conn);
             self.transaction_depth -= 1;
             return Error.ExecuteFailed;
         }
         const status = c.PQresultStatus(result);
         if (status != c.PGRES_COMMAND_OK) {
+            self.rememberResultError(result);
             self.transaction_depth -= 1;
             return Error.ExecuteFailed;
         }
