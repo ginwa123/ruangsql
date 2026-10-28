@@ -82,6 +82,49 @@ test "init on an invalid port returns an error" {
     try testing.expectError(Error.OpenFailed, result);
 }
 
+test "a refused connection remembers what libpq said" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    var db: PostgresBackend = .{};
+    defer db.deinit();
+
+    // Port 1 refuses immediately on every platform, so this needs no server and no CI secret.
+    try testing.expectError(Error.OpenFailed, db.init(threaded.io(), "host=127.0.0.1 port=1 dbname=ruangsql_probe connect_timeout=2"));
+
+    const message = db.getLastErrorMessage() orelse return error.ExpectedLastErrorMessage;
+    try testing.expect(std.mem.indexOf(u8, message, "127.0.0.1") != null);
+}
+
+test "a failed statement remembers the server's message" {
+    const alloc = testing.allocator;
+    const env = ensureEnv(alloc);
+    if (!env.is_available) return;
+
+    var ctx = try setupDb(alloc, env);
+    defer teardown(alloc, &ctx);
+
+    try testing.expectError(Error.ExecuteFailed, ctx.db.exec(alloc, "INSERT INTO ruangsql_no_such_table (x) VALUES (?)", &.{"1"}));
+
+    const message = ctx.db.getLastErrorMessage() orelse return error.ExpectedLastErrorMessage;
+    try testing.expect(std.mem.indexOf(u8, message, "ruangsql_no_such_table") != null);
+}
+
+test "a statement that succeeds leaves the last failure alone" {
+    const alloc = testing.allocator;
+    const env = ensureEnv(alloc);
+    if (!env.is_available) return;
+
+    var ctx = try setupDb(alloc, env);
+    defer teardown(alloc, &ctx);
+
+    try testing.expectError(Error.ExecuteFailed, ctx.db.exec(alloc, "INSERT INTO ruangsql_no_such_table (x) VALUES (?)", &.{"1"}));
+    try testing.expect(ctx.db.getLastErrorMessage() != null);
+    try ctx.db.exec(alloc, "SELECT 1", &.{});
+    // "Last error", not "current state": a success must not erase the previous failure's diagnosis.
+    try testing.expect(ctx.db.getLastErrorMessage() != null);
+}
+
 test "init on a non-existent database returns an error" {
     const alloc = testing.allocator;
     const env = ensureEnv(alloc);
